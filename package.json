@@ -1,27 +1,30 @@
 {
-  "name": "datsan-back",
-  "version": "1.0.0",
+  "name": "datsan-back-v2",
+  "version": "2.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danganhquan200605/datsan-back.git"
+    "url": "git+https://github.com/danganhquan200605/datsan-back-v2.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/danganhquan200605/datsan-back/issues"
+    "url": "https://github.com/danganhquan200605/datsan-back-v2/issues"
   },
-  "homepage": "https://github.com/danganhquan200605/datsan-back#readme",
+  "homepage": "https://github.com/danganhquan200605/datsan-back-v2#readme",
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
+    "multer": "^2.5.0",
     "pg": "^8.23.1"
   }
 }
