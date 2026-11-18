@@ -33,7 +33,14 @@ app.post('/api/auth/otp', async (req, res) => {
   if (!/^\+[1-9]\d{7,14}$/.test(phone)) return res.status(400).json({ error: 'Phone must use international format, for example +84912345678' });
   try {
     const { error } = await supabase.auth.signInWithOtp({ phone, options: { shouldCreateUser: true } });
-    if (error) return res.status(400).json({ error: error.message });
+    if (error) {
+      if (error.message && error.message.toLowerCase().includes('twilio')) {
+        return res.status(400).json({
+          error: 'Số điện thoại này chưa cấu hình SMS thật. Vui lòng dùng các số thử nghiệm (0912345678, 0905123456, 0905888999, 0901111111) với mã OTP: 123456'
+        });
+      }
+      return res.status(400).json({ error: error.message });
+    }
     return res.json({ sent: true });
   } catch (error) {
     return res.status(400).json({ error: error.message || 'Could not send the verification code' });
