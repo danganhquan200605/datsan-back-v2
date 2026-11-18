@@ -9,6 +9,10 @@ Express API for the DatSan frontend. This service proxies the limited set of Sup
 3. Set `ALLOWED_ORIGINS` to the frontend origin(s), comma separated.
 4. Run `npm install` and `npm start`.
 
-## Important
+## Security rollout
 
-The browser no longer contains Supabase configuration and calls this API instead. The API currently uses the Supabase **anon** key, so database Row Level Security policies remain the actual access control. The inherited app stores a user profile in `sessionStorage` and has a demo OTP flow; it does not yet provide trustworthy server-side authentication or role authorization. Do not expose a Supabase service-role key here. Configure restrictive RLS before public use, and replace demo login and booking writes with authenticated, validated API operations. The API adapter currently does not implement Supabase realtime; screens refresh on their existing fetch triggers.
+The API uses the Supabase **anon** key and forwards verified Supabase access tokens for protected operations. It never uses a service-role key. Public field availability is exposed through a limited RPC; booking creation goes through a transaction that validates the selected slots and computes the price on the database side.
+
+Before deploying these code changes, review and apply `supabase/migrations/20261117_auth_rls_bookings.sql` to the Supabase project. The migration replaces the current permissive `public` policies and adds a `nguoidung.auth_user_id` link. The project is also used by the legacy app, so applying it changes what that app can read and write; its demo sign-in and direct booking writes will no longer work. Phone Auth is currently disabled in Supabase and needs a configured SMS provider before OTP login can work. Do not expose a Supabase service-role key.
+
+The API adapter refreshes screen data by polling; it does not implement Supabase Realtime.
