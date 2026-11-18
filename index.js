@@ -88,7 +88,7 @@ app.post('/api/bookings', async (req, res) => {
   const slots = req.body?.slotIds;
   const date = String(req.body?.date || '');
   if (!Number.isInteger(masan) || masan <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
-      !Array.isArray(slots) || slots.length < 1 || slots.length > 12 ||
+      !Array.isArray(slots) || slots.length < 1 || slots.length > 14 ||
       slots.some((id) => !Number.isInteger(Number(id)) || Number(id) <= 0)) {
     return res.status(400).json({ error: 'Invalid booking details' });
   }
