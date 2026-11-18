@@ -36,7 +36,7 @@ app.post('/api/auth/otp', async (req, res) => {
     if (error) {
       if (error.message && error.message.toLowerCase().includes('twilio')) {
         return res.status(400).json({
-          error: 'Số điện thoại này chưa cấu hình SMS thật. Vui lòng dùng các số thử nghiệm (0912345678, 0905123456, 0905888999, 0901111111) với mã OTP: 123456'
+          error: 'Số điện thoại này chưa thể nhận mã SMS trực tiếp. Vui lòng kiểm tra lại số điện thoại hoặc liên hệ quản trị viên để được hỗ trợ.'
         });
       }
       return res.status(400).json({ error: error.message });
