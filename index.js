@@ -75,6 +75,23 @@ app.post('/api/auth/verify', async (req, res) => {
   }
 });
 
+app.post('/api/auth/refresh', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const refreshToken = String(req.body?.refreshToken || '').trim();
+  if (!refreshToken) return res.status(400).json({ error: 'Refresh token is required' });
+  try {
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data.session) return res.status(401).json({ error: error?.message || 'Invalid refresh token' });
+    return res.json({
+      accessToken: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+      expiresAt: data.session.expires_at,
+    });
+  } catch (error) {
+    return res.status(401).json({ error: error.message || 'Could not refresh token' });
+  }
+});
+
 app.get('/api/availability', async (req, res) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const date = String(req.query.date || '');
