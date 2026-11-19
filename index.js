@@ -144,6 +144,7 @@ app.post('/api/bookings', async (req, res) => {
   const masan = Number(req.body?.masan);
   const slots = req.body?.slotIds;
   const date = String(req.body?.date || '');
+  const paymentMethod = req.body?.paymentMethod === 'TIEN_MAT' ? 'TIEN_MAT' : 'QR';
   if (!Number.isInteger(masan) || masan <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
       !Array.isArray(slots) || slots.length < 1 || slots.length > 14 ||
       slots.some((id) => !Number.isInteger(Number(id)) || Number(id) <= 0)) {
@@ -156,7 +157,121 @@ app.post('/api/bookings', async (req, res) => {
     p_dichvu: req.body?.services && typeof req.body.services === 'object' ? req.body.services : {},
   });
   if (error) return res.status(400).json({ error: error.message });
+
+  // Cập nhật phương thức thanh toán 100% và cơ chế hoa hồng
+  const madatsan = data?.madatsan || data?.MaDatSan || data;
+  if (madatsan && adminSupabase) {
+    const bookingTotal = Number(data?.tongtien || data?.TongTien || 0);
+    const commissionAmount = Math.round(bookingTotal * 0.1); // 10% hoa hồng sàn
+    const isCash = paymentMethod === 'TIEN_MAT';
+    const status = isCash ? 'CHO_THI_DAU' : 'DA_THANH_TOAN';
+    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : 'DA_THU_SAN';
+
+    const meta = {
+      paymentMethod,
+      commissionRate: 0.1,
+      commissionAmount,
+      commissionStatus,
+      services: req.body?.services || {},
+      paidAmount: isCash ? 0 : bookingTotal,
+      remainingAmount: isCash ? bookingTotal : 0
+    };
+
+    await adminSupabase.from('datsan').update({
+      trangthai: status,
+      ghichu: JSON.stringify(meta)
+    }).eq('madatsan', madatsan);
+
+    if (typeof data === 'object' && data !== null) {
+      data.trangthai = status;
+      data.ghichu = JSON.stringify(meta);
+      data.phuongthuc = paymentMethod;
+    }
+  }
+
   return res.json({ data });
+});
+
+app.post('/api/owner/settle-booking', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const userClient = await getAuthenticatedClient(req);
+  if (!userClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+  
+  const { action, bookingId, ownerId } = req.body || {};
+
+  try {
+    if (action === 'CONFIRM_CASH') {
+      // 1. Chủ sân xác nhận đã thu 100% tiền mặt & hoàn thành trận đấu
+      const { data: booking, error: getErr } = await adminSupabase.from('datsan').select('*').eq('madatsan', bookingId).single();
+      if (getErr || !booking) return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+
+      let meta = {};
+      try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
+      meta.paymentMethod = 'TIEN_MAT';
+      meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
+      meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
+      meta.completedAt = new Date().toISOString();
+
+      const { data, error } = await adminSupabase.from('datsan').update({
+        trangthai: 'HOAN_THANH',
+        ghichu: JSON.stringify(meta)
+      }).eq('madatsan', bookingId).select().single();
+
+      if (error) throw error;
+      return res.json({ success: true, data });
+    }
+
+    if (action === 'CANCEL_NO_SHOW') {
+      // 2. Chủ sân báo khách bùng / hủy trận đấu tiền mặt
+      const { data: booking, error: getErr } = await adminSupabase.from('datsan').select('*').eq('madatsan', bookingId).single();
+      if (getErr || !booking) return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+
+      let meta = {};
+      try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
+      meta.paymentMethod = 'TIEN_MAT';
+      meta.commissionStatus = 'DA_HUY'; // Xóa sổ nợ hoa hồng
+      meta.commissionAmount = 0;
+      meta.cancelledAt = new Date().toISOString();
+
+      const { data, error } = await adminSupabase.from('datsan').update({
+        trangthai: 'DA_HUY',
+        ghichu: JSON.stringify(meta)
+      }).eq('madatsan', bookingId).select().single();
+
+      if (error) throw error;
+      return res.json({ success: true, data });
+    }
+
+    if (action === 'SETTLE_ALL_COMMISSIONS') {
+      // 3. Chủ sân quét QR nộp toàn bộ công nợ hoa hồng tích lũy cho Admin
+      const targetOwnerId = Number(ownerId);
+      if (!targetOwnerId) return res.status(400).json({ error: 'Thiếu mã chủ sân' });
+
+      const { data: sans } = await adminSupabase.from('san').select('masan').eq('machusan', targetOwnerId);
+      const sanIds = (sans || []).map(s => s.masan);
+      if (sanIds.length === 0) return res.json({ success: true, settledCount: 0 });
+
+      const { data: bookings } = await adminSupabase.from('datsan').select('*').in('masan', sanIds).eq('trangthai', 'HOAN_THANH');
+      let settledCount = 0;
+
+      for (const b of (bookings || [])) {
+        let meta = {};
+        try { meta = JSON.parse(b.ghichu || '{}'); } catch (e) {}
+        if (meta.commissionStatus === 'CHO_CHUSAN_NOP') {
+          meta.commissionStatus = 'DA_QUYET_TOAN';
+          meta.settledAt = new Date().toISOString();
+          await adminSupabase.from('datsan').update({ ghichu: JSON.stringify(meta) }).eq('madatsan', b.madatsan);
+          settledCount++;
+        }
+      }
+
+      return res.json({ success: true, settledCount });
+    }
+
+    return res.status(400).json({ error: 'Hành động không hợp lệ' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Lỗi xử lý quyết toán' });
+  }
 });
 
 async function getAuthenticatedClient(req) {
