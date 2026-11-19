@@ -445,14 +445,113 @@ async function autoCompleteExpiredBookings() {
   }
 }
 
-// Chạy tự động kiểm tra mỗi 30 giây
-setInterval(autoCompleteExpiredBookings, 30000);
-setTimeout(autoCompleteExpiredBookings, 3000);
+// HÀM TỰ ĐỘNG GỬI THÔNG BÁO NHẮC NỢ KHI QUÁ HẠN 1 TUẦN (7 NGÀY)
+async function autoSendOverdueDebtReminders() {
+  if (!adminSupabase) return 0;
+  try {
+    const { data: bookings, error } = await adminSupabase
+      .from('datsan')
+      .select(`
+        madatsan,
+        masan,
+        ngaysudung,
+        ngaydat,
+        tongtien,
+        trangthai,
+        ghichu,
+        san (tensan, machusan)
+      `)
+      .in('trangthai', ['HOAN_THANH', 'HOANTHANH']);
 
-// Endpoint kích hoạt kiểm tra auto-complete thủ công
+    if (error || !bookings || bookings.length === 0) return 0;
+
+    const oneWeekMs = 7 * 24 * 60 * 60 * 1000;
+    const nowTime = Date.now();
+
+    // Lọc các đơn nợ hoa hồng quá hạn 1 tuần
+    const overdueBookings = bookings.filter((b) => {
+      let meta = {};
+      try { meta = JSON.parse(b.ghichu || '{}'); } catch (e) {}
+      const isCash = meta.paymentMethod === 'TIEN_MAT' || !meta.paymentMethod;
+      const isPendingCommission = meta.commissionStatus === 'CHO_CHUSAN_NOP';
+      if (!isCash || !isPendingCommission) return false;
+
+      const dateStr = b.ngaysudung || b.ngaydat;
+      if (!dateStr) return false;
+      const bDate = new Date(dateStr).getTime();
+      return (nowTime - bDate) >= oneWeekMs;
+    });
+
+    if (overdueBookings.length === 0) return 0;
+
+    // Nhóm theo chủ sân
+    const ownerDebts = {};
+    for (const b of overdueBookings) {
+      const ownerId = b.san?.machusan;
+      if (!ownerId) continue;
+      let meta = {};
+      try { meta = JSON.parse(b.ghichu || '{}'); } catch (e) {}
+      const commission = Number(meta.commissionAmount || Math.round(Number(b.tongtien || 0) * 0.1));
+
+      if (!ownerDebts[ownerId]) {
+        ownerDebts[ownerId] = { total: 0, count: 0, pitchNames: new Set() };
+      }
+      ownerDebts[ownerId].total += commission;
+      ownerDebts[ownerId].count += 1;
+      if (b.san?.tensan) ownerDebts[ownerId].pitchNames.add(b.san.tensan);
+    }
+
+    let sentCount = 0;
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    for (const [ownerIdStr, info] of Object.entries(ownerDebts)) {
+      const ownerId = Number(ownerIdStr);
+      // Kiểm tra xem trong vòng 24 giờ qua đã gửi thông báo tự động nhắc nợ này chưa (tránh spam lặp lại)
+      const { data: recentNotif } = await adminSupabase
+        .from('thongbao')
+        .select('mathongbao')
+        .eq('manguoidung', ownerId)
+        .eq('loaithongbao', 'REMINDER')
+        .ilike('tieude', '%[Tự động]%')
+        .gte('created_at', oneDayAgo)
+        .limit(1);
+
+      if (!recentNotif || recentNotif.length === 0) {
+        const pitchListStr = Array.from(info.pitchNames).join(', ');
+        await adminSupabase.from('thongbao').insert({
+          manguoidung: ownerId,
+          tieude: '⚠️ [Tự động] Nhắc nộp hoa hồng quá hạn 1 tuần',
+          noidung: `Hệ thống DatSanOnline phát hiện bạn có ${info.count} đơn tiền mặt tại ${pitchListStr || 'sân'} đã hoàn thành hơn 7 ngày với tổng nợ hoa hồng 10% là ${info.total.toLocaleString('vi-VN')} đ chưa thanh toán. Vui lòng vào trang Quản Lý Sân quét mã VietQR để thanh toán cho sàn tránh bị gián đoạn hoạt động sân.`,
+          loaithongbao: 'REMINDER'
+        });
+        console.log(`[Auto Reminder] Đã tự động gửi thông báo nhắc nợ quá hạn 1 tuần tới chủ sân ID ${ownerId} (${info.total.toLocaleString('vi-VN')} đ)`);
+        sentCount++;
+      }
+    }
+
+    return sentCount;
+  } catch (err) {
+    console.error('Lỗi khi tự động gửi nhắc nợ quá hạn:', err);
+    return 0;
+  }
+}
+
+// Chạy tự động kiểm tra mỗi 30 giây (duyệt ca quá hạn & gửi nhắc nợ quá hạn 1 tuần)
+setInterval(async () => {
+  await autoCompleteExpiredBookings();
+  await autoSendOverdueDebtReminders();
+}, 30000);
+
+setTimeout(async () => {
+  await autoCompleteExpiredBookings();
+  await autoSendOverdueDebtReminders();
+}, 3000);
+
+// Endpoint kích hoạt kiểm tra auto-complete & auto-reminder thủ công
 app.post('/api/bookings/auto-complete', async (_req, res) => {
   const updatedCount = await autoCompleteExpiredBookings();
-  return res.json({ success: true, updatedCount });
+  const reminderCount = await autoSendOverdueDebtReminders();
+  return res.json({ success: true, updatedCount, reminderCount });
 });
 
 // ROUTE THÔNG BÁO HỆ THỐNG (NOTIFICATIONS API)
