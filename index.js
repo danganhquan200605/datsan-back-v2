@@ -352,6 +352,181 @@ app.post('/api/owner/settle-booking', async (req, res) => {
   }
 });
 
+// HELPER: Ảnh thể thao chất lượng cao HD mặc định theo loại sân
+const getDefaultImageBySport = (tenLoaiSan = '') => {
+  const lower = String(tenLoaiSan || '').toLowerCase();
+  if (lower.includes('cầu lông')) {
+    return 'https://images.unsplash.com/photo-1626248801379-51a0748a5f96?auto=format&fit=crop&w=1200&q=80';
+  }
+  if (lower.includes('pickleball')) {
+    return 'https://images.unsplash.com/photo-1554068865-24cecd4e34b8?auto=format&fit=crop&w=1200&q=80';
+  }
+  if (lower.includes('tennis')) {
+    return 'https://images.unsplash.com/photo-1554068865-24cecd4e34b8?auto=format&fit=crop&w=1200&q=80';
+  }
+  if (lower.includes('bóng rổ')) {
+    return 'https://images.unsplash.com/photo-1519766304817-4f37bda74a29?auto=format&fit=crop&w=1200&q=80';
+  }
+  if (lower.includes('bóng chuyền')) {
+    return 'https://images.unsplash.com/photo-1612872087720-bb876e2e67d1?auto=format&fit=crop&w=1200&q=80';
+  }
+  if (lower.includes('bóng bàn')) {
+    return 'https://images.unsplash.com/photo-1534158914592-062992fbe900?auto=format&fit=crop&w=1200&q=80';
+  }
+  // Mặc định cho bóng đá cỏ nhân tạo / sân 5, 7, 11
+  return 'https://images.unsplash.com/photo-1529900248057-5e632c63c574?auto=format&fit=crop&w=1200&q=80';
+};
+
+// ENDPOINT: ĐĂNG KÝ CỤM SÂN MỚI (ATOMIC & BYPASS CLIENT RLS)
+app.post('/api/fields/register', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Hệ thống database chưa sẵn sàng' });
+  const userClient = await getAuthenticatedClient(req);
+  if (!userClient) return res.status(401).json({ error: 'Vui lòng đăng nhập để thực hiện đăng ký sân' });
+
+  const { data: profile } = await userClient.rpc('ensure_current_nguoidung');
+  const userId = profile?.MaNguoiDung || profile?.manguoidung || req.body?.userId;
+  if (!userId) return res.status(401).json({ error: 'Không tìm thấy thông tin tài khoản hợp lệ' });
+
+  const {
+    tenSan,
+    maLoaiSan,
+    giaSan,
+    moTa,
+    hinhanhMain,
+    hinhanhSub1,
+    hinhanhSub2,
+    hinhanhSub3,
+    badges,
+    amenities,
+    quan,
+    phuong,
+    diaChi
+  } = req.body || {};
+
+  // Kiểm tra các trường BẮT BUỘC (Không được để trống)
+  if (!tenSan || !String(tenSan).trim()) {
+    return res.status(400).json({ error: 'Vui lòng nhập tên cụm sân!' });
+  }
+  const rawGiaSan = Number(giaSan);
+  if (!rawGiaSan || rawGiaSan <= 0) {
+    return res.status(400).json({ error: 'Vui lòng nhập giá thuê hợp lệ!' });
+  }
+  if (!maLoaiSan || isNaN(Number(maLoaiSan))) {
+    return res.status(400).json({ error: 'Vui lòng chọn loại sân!' });
+  }
+  if (!quan || !String(quan).trim()) {
+    return res.status(400).json({ error: 'Vui lòng chọn Quận / Huyện!' });
+  }
+  if (!phuong || !String(phuong).trim()) {
+    return res.status(400).json({ error: 'Vui lòng nhập Phường / Xã!' });
+  }
+  if (!diaChi || !String(diaChi).trim()) {
+    return res.status(400).json({ error: 'Vui lòng nhập Địa chỉ chi tiết!' });
+  }
+
+  try {
+    // 1. Thêm vị trí
+    const { data: newViTri, error: vtErr } = await adminSupabase
+      .from('vitri')
+      .insert([{
+        diachi: String(diaChi).trim(),
+        phuong: String(phuong).trim(),
+        quan: String(quan).trim(),
+        thanhpho: 'Đà Nẵng'
+      }])
+      .select()
+      .single();
+
+    if (vtErr) throw vtErr;
+    const maViTri = newViTri.mavitri || newViTri.MaViTri;
+
+    // 2. Xử lý Ảnh & Mô Tả (CHO PHÉP ĐỂ TRỐNG: Tự động gán dữ liệu chuẩn)
+    let finalMainImg = String(hinhanhMain || '').trim();
+    if (!finalMainImg) {
+      const { data: lsRow } = await adminSupabase.from('loaisan').select('tenloaisan').eq('maloaisan', Number(maLoaiSan)).single();
+      finalMainImg = getDefaultImageBySport(lsRow?.tenloaisan);
+    }
+
+    const finalMoTa = String(moTa || '').trim() || 'Cụm sân thể thao tiêu chuẩn, mặt sân chất lượng cao, trang thiết bị và hệ thống chiếu sáng hiện đại phục vụ thi đấu.';
+
+    const subImgs = [hinhanhSub1, hinhanhSub2, hinhanhSub3].filter(img => img && String(img).trim());
+
+    // 3. Thêm sân mới vào bảng san
+    const sanPayload = {
+      machusan: userId,
+      maloaisan: Number(maLoaiSan),
+      mavitri: maViTri,
+      tensan: String(tenSan).trim(),
+      mota: finalMoTa,
+      giasan: rawGiaSan,
+      hinhanh: finalMainImg,
+      trangthai: 'CHO_DUYET'
+    };
+
+    if (subImgs.length > 0) sanPayload.hinhanh_phu = subImgs;
+    if (Array.isArray(badges) && badges.length > 0) sanPayload.huyhieu = badges;
+    if (Array.isArray(amenities) && amenities.length > 0) sanPayload.tienich = amenities;
+
+    const { data: newSan, error: sanErr } = await adminSupabase
+      .from('san')
+      .insert([sanPayload])
+      .select()
+      .single();
+
+    if (sanErr) throw sanErr;
+    const maSanCreated = newSan.masan || newSan.MaSan;
+
+    // 4. Khởi tạo sẵn 14 khung giờ thi đấu tiêu chuẩn (07:00 - 23:00)
+    const defaultSlots = [
+      { giobatdau: '07:00:00', gioketthuc: '08:00:00' },
+      { giobatdau: '08:00:00', gioketthuc: '09:00:00' },
+      { giobatdau: '09:00:00', gioketthuc: '10:00:00' },
+      { giobatdau: '10:00:00', gioketthuc: '11:00:00' },
+      { giobatdau: '13:00:00', gioketthuc: '14:00:00' },
+      { giobatdau: '14:00:00', gioketthuc: '15:00:00' },
+      { giobatdau: '15:00:00', gioketthuc: '16:00:00' },
+      { giobatdau: '16:00:00', gioketthuc: '17:00:00' },
+      { giobatdau: '17:00:00', gioketthuc: '18:00:00' },
+      { giobatdau: '18:00:00', gioketthuc: '19:00:00' },
+      { giobatdau: '19:00:00', gioketthuc: '20:00:00' },
+      { giobatdau: '20:00:00', gioketthuc: '21:00:00' },
+      { giobatdau: '21:00:00', gioketthuc: '22:00:00' },
+      { giobatdau: '22:00:00', gioketthuc: '23:00:00' }
+    ];
+
+    const slotsToInsert = defaultSlots.map(s => ({
+      masan: maSanCreated,
+      giobatdau: s.giobatdau,
+      gioketthuc: s.gioketthuc,
+      trangthai: 'TRONG'
+    }));
+
+    await adminSupabase.from('khunggio').insert(slotsToInsert);
+
+    // 5. Gửi thông báo cho Admin về sân mới chờ duyệt
+    try {
+      const { data: admins } = await adminSupabase.from('nguoidung').select('manguoidung').eq('vaitro', 'ADMIN');
+      if (admins && admins.length > 0) {
+        for (const adm of admins) {
+          await adminSupabase.from('thongbao').insert({
+            manguoidung: adm.manguoidung,
+            tieude: '🏢 Hồ sơ sân mới chờ duyệt',
+            noidung: `Chủ sân ${profile.HoTen || profile.hoten || ''} vừa đăng ký cụm sân "${String(tenSan).trim()}". Vui lòng kiểm tra và duyệt hồ sơ trong mục Quản trị.`,
+            loaithongbao: 'NEW_FIELD'
+          });
+        }
+      }
+    } catch (notifErr) {
+      console.warn('Lỗi gửi thông báo admin khi đăng ký sân:', notifErr.message);
+    }
+
+    return res.json({ success: true, san: newSan });
+  } catch (err) {
+    console.error('Lỗi đăng ký sân backend:', err);
+    return res.status(500).json({ error: err.message || 'Lỗi lưu thông tin sân bãi' });
+  }
+});
+
 // HÀM TỰ ĐỘNG DUYỆT HOÀN TẤT KHI QUÁ GIỜ ĐẶT 1 TIẾNG (AUTO-COMPLETE)
 async function autoCompleteExpiredBookings() {
   if (!adminSupabase) return 0;
