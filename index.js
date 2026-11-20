@@ -826,8 +826,24 @@ app.post('/api/data', async (req, res) => {
   if (!['select', 'insert', 'update'].includes(action)) return res.status(400).json({ error: 'Unsupported action' });
 
   const requiresAuth = action !== 'select' || ['nguoidung', 'danhgia', 'datsan', 'datsan_khunggio'].includes(table);
-  const requestClient = requiresAuth ? await getAuthenticatedClient(req) : supabase;
-  if (!requestClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+  const authClient = await getAuthenticatedClient(req);
+  let requestClient = authClient;
+
+  if (!requestClient) {
+    if (requiresAuth) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    requestClient = supabase;
+  } else if (adminSupabase) {
+    // Nếu tài khoản là ADMIN, dùng adminSupabase để xem toàn bộ hồ sơ sân chờ duyệt (bỏ qua RLS anon)
+    try {
+      const { data: profile } = await authClient.rpc('ensure_current_nguoidung');
+      const role = String(profile?.vaitro || profile?.VaiTro || '').toUpperCase();
+      if (role === 'ADMIN') {
+        requestClient = adminSupabase;
+      }
+    } catch {
+      // Giữ nguyên authClient nếu không check được profile
+    }
+  }
   if (action === 'insert' && ['datsan', 'datsan_khunggio'].includes(table)) {
     return res.status(403).json({ error: 'Bookings must use the atomic booking endpoint' });
   }
