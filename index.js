@@ -735,15 +735,26 @@ app.get('/api/notifications', async (req, res) => {
   const userId = req.query.manguoidung ? Number(req.query.manguoidung) : null;
   const role = String(req.query.role || '').toUpperCase();
 
+  // Khách vãng lai chưa đăng nhập -> không có thông báo cá nhân
+  if (!userId && role !== 'ADMIN') {
+    return res.json({ data: [] });
+  }
+
   try {
     let query = adminSupabase.from('thongbao').select('*').order('created_at', { ascending: false }).limit(30);
-    if (userId) {
-      if (role === 'ADMIN') {
-        query = query.or(`manguoidung.eq.${userId},manguoidung.is.null,loaithongbao.eq.ADMIN`);
-      } else {
-        query = query.or(`manguoidung.eq.${userId},manguoidung.is.null`);
-      }
+
+    if (role === 'ADMIN') {
+      // Super Admin: xem thông báo trực tiếp cho admin, các thông báo ADMIN sàn, yêu cầu duyệt sân mới, hoặc thông báo chung
+      query = query.or(`manguoidung.eq.${userId || 1},manguoidung.is.null,loaithongbao.eq.ADMIN,loaithongbao.eq.NEW_FIELD,loaithongbao.eq.BROADCAST`);
+    } else if (role === 'CHUSAN') {
+      // Chủ sân: CHỈ xem thông báo gửi đích danh cho chủ sân này (đơn đặt sân, nhắc nợ, hoàn tất ca, xác nhận nộp tiền) + thông báo phát sóng chung BROADCAST
+      query = query.or(`manguoidung.eq.${userId},loaithongbao.eq.BROADCAST`);
+    } else {
+      // Khách hàng (KHACHHANG hoặc vai trò khác):
+      // CHỈ xem thông báo gửi đích danh cho khách hàng này (đặt sân thành công, ca đấu hoàn tất, hủy sân hoàn tiền) + thông báo phát sóng chung BROADCAST
+      query = query.or(`manguoidung.eq.${userId},loaithongbao.eq.BROADCAST`);
     }
+
     const { data, error } = await query;
     if (error) throw error;
     return res.json({ data: data || [] });
@@ -776,10 +787,15 @@ app.post('/api/notifications', async (req, res) => {
 app.post('/api/notifications/read', async (req, res) => {
   if (!adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const { mathongbao, manguoidung, all } = req.body || {};
+  const role = String(req.body.role || '').toUpperCase();
 
   try {
     if (all && manguoidung) {
-      await adminSupabase.from('thongbao').update({ dread: true }).eq('manguoidung', Number(manguoidung));
+      if (role === 'ADMIN') {
+        await adminSupabase.from('thongbao').update({ dread: true }).or(`manguoidung.eq.${Number(manguoidung)},manguoidung.is.null,loaithongbao.eq.ADMIN`);
+      } else {
+        await adminSupabase.from('thongbao').update({ dread: true }).eq('manguoidung', Number(manguoidung));
+      }
     } else if (all) {
       await adminSupabase.from('thongbao').update({ dread: true }).eq('dread', false);
     } else if (mathongbao) {
