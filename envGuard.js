@@ -78,6 +78,17 @@ function isProductionRender(env = process.env) {
  * Validates the environment configuration against safety guard rules
  */
 function validateEnvironmentConfig(env = process.env) {
+  // Requirement: FINANCIAL_MODE must be strictly 'DEMO' across all environments
+  const financialMode = String(env.FINANCIAL_MODE || '').trim().toUpperCase();
+  if (financialMode !== 'DEMO') {
+    return {
+      ok: false,
+      code: 'ERR_INVALID_FINANCIAL_MODE',
+      mode: isProductionRender(env) ? 'PRODUCTION_RENDER' : 'LOCAL_DEV',
+      error: `INVALID_FINANCIAL_MODE: FINANCIAL_MODE is required to be strictly 'DEMO' (detected: "${env.FINANCIAL_MODE || ''}"). Backend startup refused to prevent real financial transactions.`
+    };
+  }
+
   const isProd = isProductionRender(env);
 
   // Requirement 6: Do not apply Staging-only rule to Production Render

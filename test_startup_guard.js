@@ -1,19 +1,15 @@
 /**
- * DATSANONLINE — TEST SUITE: STARTUP ENVIRONMENT GUARD
+ * DATSANONLINE — TEST SUITE: STARTUP ENVIRONMENT GUARD & FINANCIAL MODE ENFORCEMENT
  * 
  * Tests:
- * 1. Valid Staging configuration in Local/Dev mode
- * 2. Hard block when Production Project Ref (ckrmfyuymuvaiymfxvhj) is in SUPABASE_URL
- * 3. Hard block when Production Ref is in DATABASE_URL (direct URI)
- * 4. Hard block when Production Ref is in DATABASE_URL (pooler URI)
- * 5. Hard block when Production Ref is in arbitrary env variables
- * 6. Hard block when Production Ref is in JWT token payload
- * 7. Hard block when Staging SUPABASE_URL is missing (no fallback)
- * 8. Hard block when Staging API keys are missing
- * 9. Hard block when foreign unapproved Project Ref is supplied
- * 10. Authorization in Production Render environment (RENDER=true)
- * 11. Process integration test: verifying node index.js exits with code 1 when given Production Ref
- * 12. Process integration test: verifying node index.js exits with code 1 when missing config
+ * 1. URL & JWT Ref Extraction
+ * 2. Valid Staging configuration in Local/Dev mode (FINANCIAL_MODE=DEMO)
+ * 3. Production Ref (ckrmfyuymuvaiymfxvhj) Hard Block (URL, DB URI, Pooler, JWT, Env)
+ * 4. Missing Staging Configuration (Zero fallback)
+ * 5. Unapproved Foreign Supabase Ref
+ * 6. Mandatory FINANCIAL_MODE=DEMO Enforcement (blocks LIVE, PRODUCTION, empty)
+ * 7. Production Render Environment Authorization (RENDER=true, allows prod DB)
+ * 8. Real Child Process Execution (Production blocked, Invalid financial mode blocked, Missing config blocked)
  */
 
 const {
@@ -42,7 +38,7 @@ function assert(condition, message) {
 }
 
 console.log('========================================================================');
-console.log('DATSANONLINE — STARTUP ENVIRONMENT GUARD VERIFICATION SUITE');
+console.log('DATSANONLINE — STARTUP GUARD & FINANCIAL MODE VERIFICATION SUITE');
 console.log('========================================================================\n');
 
 // Mock Staging JWT & Production JWT tokens for testing
@@ -92,6 +88,7 @@ assert(
 console.log('\n--- 2. VALID STAGING CONFIGURATION (LOCAL/DEV) ---');
 
 const validStagingEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: stagingAnonKey,
   DATABASE_URL: `postgresql://postgres:pass@db.${STAGING_PROJECT_REF}.supabase.co:5432/postgres`
@@ -102,7 +99,6 @@ assert(stagingRes.ok === true, 'Staging configuration is accepted');
 assert(stagingRes.mode === 'LOCAL_DEV', 'Correctly identified mode as LOCAL_DEV');
 assert(stagingRes.stagingRef === STAGING_PROJECT_REF, 'Correctly matched Staging ref');
 
-// Also test enforceStartupEnvironmentGuard does not throw for valid staging
 try {
   const enforced = enforceStartupEnvironmentGuard({ env: validStagingEnv, exitOnError: false });
   assert(enforced.ok === true, 'enforceStartupEnvironmentGuard passes for valid Staging');
@@ -117,6 +113,7 @@ console.log('\n--- 3. PRODUCTION REF (ckrmfyuymuvaiymfxvhj) HARD BLOCK ---');
 
 // 3a. Production SUPABASE_URL
 const prodUrlEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${PRODUCTION_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: stagingAnonKey
 };
@@ -126,6 +123,7 @@ assert(prodUrlRes.code === 'ERR_PRODUCTION_REF_BLOCKED', 'Error code is ERR_PROD
 
 // 3b. Production direct DATABASE_URL
 const prodDbEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: stagingAnonKey,
   DATABASE_URL: `postgresql://postgres:secret@db.${PRODUCTION_PROJECT_REF}.supabase.co:5432/postgres`
@@ -136,6 +134,7 @@ assert(prodDbRes.code === 'ERR_PRODUCTION_REF_BLOCKED', 'Direct DB error code is
 
 // 3c. Production pooler DATABASE_URL
 const prodPoolerEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: stagingAnonKey,
   DATABASE_URL: `postgresql://postgres.${PRODUCTION_PROJECT_REF}:secret@aws-1-ap-northeast-2.pooler.supabase.com:5432/postgres`
@@ -146,6 +145,7 @@ assert(prodPoolerRes.code === 'ERR_PRODUCTION_REF_BLOCKED', 'Pooler DB error cod
 
 // 3d. Production JWT token
 const prodJwtEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: prodAnonKey
 };
@@ -155,6 +155,7 @@ assert(prodJwtRes.code === 'ERR_PRODUCTION_REF_BLOCKED', 'JWT error code is ERR_
 
 // 3e. Production Ref in arbitrary env var
 const prodArbitraryEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: stagingAnonKey,
   ARBITRARY_VAR: `some-config-with-${PRODUCTION_PROJECT_REF}-inside`
@@ -163,7 +164,6 @@ const prodArbitraryRes = validateEnvironmentConfig(prodArbitraryEnv);
 assert(prodArbitraryRes.ok === false, 'Blocked when Production Ref is found in arbitrary env var');
 assert(prodArbitraryRes.code === 'ERR_PRODUCTION_REF_BLOCKED', 'Arbitrary env var error code is ERR_PRODUCTION_REF_BLOCKED');
 
-// Verify enforceStartupEnvironmentGuard throws with ERR_PRODUCTION_REF_BLOCKED
 try {
   enforceStartupEnvironmentGuard({ env: prodUrlEnv, exitOnError: false });
   assert(false, 'Should have thrown for Production URL');
@@ -172,12 +172,13 @@ try {
 }
 
 // --------------------------------------------------------------------------
-// 4. UNIT TESTS: MISSING STAGING CONFIGURATION (ZERO FALLBACK)
+// 4. UNIT TESTS: MISSING STAGING CONFIGURATION (NO FALLBACK)
 // --------------------------------------------------------------------------
 console.log('\n--- 4. MISSING STAGING CONFIGURATION (NO FALLBACK) ---');
 
 // 4a. Missing SUPABASE_URL
 const missingUrlEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_ANON_KEY: stagingAnonKey
 };
 const missingUrlRes = validateEnvironmentConfig(missingUrlEnv);
@@ -186,13 +187,13 @@ assert(missingUrlRes.code === 'ERR_MISSING_STAGING_CONFIG', 'Missing URL code is
 
 // 4b. Missing API keys
 const missingKeysEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`
 };
 const missingKeysRes = validateEnvironmentConfig(missingKeysEnv);
 assert(missingKeysRes.ok === false, 'Blocked when API keys are missing');
 assert(missingKeysRes.code === 'ERR_MISSING_STAGING_CONFIG', 'Missing keys code is ERR_MISSING_STAGING_CONFIG');
 
-// Verify enforceStartupEnvironmentGuard throws for missing config
 try {
   enforceStartupEnvironmentGuard({ env: missingUrlEnv, exitOnError: false });
   assert(false, 'Should have thrown for missing SUPABASE_URL');
@@ -201,11 +202,54 @@ try {
 }
 
 // --------------------------------------------------------------------------
-// 5. UNIT TESTS: UNAPPROVED FOREIGN REF
+// 5. UNIT TESTS: MANDATORY FINANCIAL_MODE=DEMO ENFORCEMENT
 // --------------------------------------------------------------------------
-console.log('\n--- 5. UNAPPROVED FOREIGN REF ---');
+console.log('\n--- 5. MANDATORY FINANCIAL_MODE=DEMO ENFORCEMENT ---');
+
+// 5a. FINANCIAL_MODE = 'LIVE'
+const liveModeEnv = {
+  FINANCIAL_MODE: 'LIVE',
+  SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
+  SUPABASE_ANON_KEY: stagingAnonKey
+};
+const liveModeRes = validateEnvironmentConfig(liveModeEnv);
+assert(liveModeRes.ok === false, 'Refused when FINANCIAL_MODE is LIVE');
+assert(liveModeRes.code === 'ERR_INVALID_FINANCIAL_MODE', 'Code is ERR_INVALID_FINANCIAL_MODE');
+
+// 5b. FINANCIAL_MODE = 'PRODUCTION'
+const prodModeEnv = {
+  FINANCIAL_MODE: 'PRODUCTION',
+  SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
+  SUPABASE_ANON_KEY: stagingAnonKey
+};
+const prodModeRes = validateEnvironmentConfig(prodModeEnv);
+assert(prodModeRes.ok === false, 'Refused when FINANCIAL_MODE is PRODUCTION');
+assert(prodModeRes.code === 'ERR_INVALID_FINANCIAL_MODE', 'Code is ERR_INVALID_FINANCIAL_MODE');
+
+// 5c. FINANCIAL_MODE missing or empty
+const emptyModeEnv = {
+  FINANCIAL_MODE: '',
+  SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
+  SUPABASE_ANON_KEY: stagingAnonKey
+};
+const emptyModeRes = validateEnvironmentConfig(emptyModeEnv);
+assert(emptyModeRes.ok === false, 'Refused when FINANCIAL_MODE is empty');
+assert(emptyModeRes.code === 'ERR_INVALID_FINANCIAL_MODE', 'Code is ERR_INVALID_FINANCIAL_MODE');
+
+try {
+  enforceStartupEnvironmentGuard({ env: liveModeEnv, exitOnError: false });
+  assert(false, 'Should have thrown for FINANCIAL_MODE=LIVE');
+} catch (err) {
+  assert(err.code === 'ERR_INVALID_FINANCIAL_MODE', 'enforceStartupEnvironmentGuard threw ERR_INVALID_FINANCIAL_MODE');
+}
+
+// --------------------------------------------------------------------------
+// 6. UNIT TESTS: UNAPPROVED FOREIGN REF
+// --------------------------------------------------------------------------
+console.log('\n--- 6. UNAPPROVED FOREIGN REF ---');
 
 const foreignEnv = {
+  FINANCIAL_MODE: 'DEMO',
   SUPABASE_URL: 'https://foreignprojectref123456.supabase.co',
   SUPABASE_ANON_KEY: stagingAnonKey
 };
@@ -214,11 +258,12 @@ assert(foreignRes.ok === false, 'Blocked foreign unapproved Supabase ref');
 assert(foreignRes.code === 'ERR_INVALID_STAGING_REF', 'Foreign ref code is ERR_INVALID_STAGING_REF');
 
 // --------------------------------------------------------------------------
-// 6. UNIT TESTS: PRODUCTION RENDER ENVIRONMENT (REQUIREMENT 6)
+// 7. UNIT TESTS: PRODUCTION RENDER ENVIRONMENT (REQUIREMENT 6)
 // --------------------------------------------------------------------------
-console.log('\n--- 6. PRODUCTION RENDER ENVIRONMENT (AUTHORIZATION) ---');
+console.log('\n--- 7. PRODUCTION RENDER ENVIRONMENT (AUTHORIZATION) ---');
 
 const prodRenderEnv = {
+  FINANCIAL_MODE: 'DEMO',
   RENDER: 'true',
   SUPABASE_URL: `https://${PRODUCTION_PROJECT_REF}.supabase.co`,
   SUPABASE_ANON_KEY: prodAnonKey
@@ -231,16 +276,17 @@ assert(prodRenderRes.mode === 'PRODUCTION_RENDER', 'Mode is PRODUCTION_RENDER');
 assert(prodRenderRes.isProduction === true, 'isProduction flag is true');
 
 // --------------------------------------------------------------------------
-// 7. PROCESS INTEGRATION TESTS: REAL CHILD PROCESS EXECUTION
+// 8. PROCESS INTEGRATION TESTS: REAL CHILD PROCESS EXECUTION
 // --------------------------------------------------------------------------
-console.log('\n--- 7. INTEGRATION TESTS (REAL NODE PROCESS LIFECYCLE) ---');
+console.log('\n--- 8. INTEGRATION TESTS (REAL NODE PROCESS LIFECYCLE) ---');
 
 const indexScriptPath = path.join(__dirname, 'index.js');
 
-// 7a. Test process fails and exits immediately when given Production URL
+// 8a. Test process fails and exits immediately when given Production URL in Local/Dev
 const childProdRun = spawnSync(process.execPath, [indexScriptPath], {
   env: {
     ...process.env,
+    FINANCIAL_MODE: 'DEMO',
     SUPABASE_URL: `https://${PRODUCTION_PROJECT_REF}.supabase.co`,
     SUPABASE_ANON_KEY: stagingAnonKey,
     PORT: '5998'
@@ -259,10 +305,30 @@ assert(
   'Output explicitly states PRODUCTION_REF_FORBIDDEN'
 );
 
-// 7b. Test process fails when missing SUPABASE_URL
+// 8b. Test process fails when FINANCIAL_MODE is not DEMO
+const childLiveModeRun = spawnSync(process.execPath, [indexScriptPath], {
+  env: {
+    ...process.env,
+    FINANCIAL_MODE: 'LIVE',
+    SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`,
+    SUPABASE_ANON_KEY: stagingAnonKey,
+    PORT: '5996'
+  },
+  encoding: 'utf8',
+  timeout: 5000
+});
+
+assert(childLiveModeRun.status === 1, `Child process exited with code 1 when FINANCIAL_MODE=LIVE (got ${childLiveModeRun.status})`);
+assert(
+  (childLiveModeRun.stderr || '').includes('ERR_INVALID_FINANCIAL_MODE') || (childLiveModeRun.stdout || '').includes('ERR_INVALID_FINANCIAL_MODE'),
+  'Output explicitly states ERR_INVALID_FINANCIAL_MODE'
+);
+
+// 8c. Test process fails when missing SUPABASE_URL
 const childMissingRun = spawnSync(process.execPath, [indexScriptPath], {
   env: {
     ...process.env,
+    FINANCIAL_MODE: 'DEMO',
     SUPABASE_URL: '',
     PORT: '5997'
   },
@@ -286,5 +352,5 @@ console.log('===================================================================
 if (failCount > 0) {
   process.exit(1);
 } else {
-  console.log('🎉 ALL STARTUP ENVIRONMENT GUARD TESTS PASSED PERFECTLY!\n');
+  console.log('🎉 ALL STARTUP ENVIRONMENT GUARD & FINANCIAL SAFETY TESTS PASSED!\n');
 }

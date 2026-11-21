@@ -242,14 +242,15 @@ app.post('/api/bookings', async (req, res) => {
   });
   if (error) return res.status(400).json({ error: error.message });
 
-  // Cập nhật phương thức thanh toán 100% và cơ chế hoa hồng
+  // Cập nhật phương thức thanh toán 100% và cơ chế hoa hồng (DEMO Mode)
   const madatsan = data?.madatsan || data?.MaDatSan || data;
   if (madatsan && adminSupabase) {
     const bookingTotal = Number(data?.tongtien || data?.TongTien || 0);
     const commissionAmount = Math.round(bookingTotal * 0.1); // 10% hoa hồng sàn
     const isCash = paymentMethod === 'TIEN_MAT';
-    const status = isCash ? 'CHO_THI_DAU' : 'DA_THANH_TOAN';
-    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : 'DA_THU_SAN';
+    const isMockPayment = paymentMethod === 'QR' || paymentMethod === 'MOCK_GATEWAY';
+    const status = isCash ? 'CHO_THI_DAU' : (isMockPayment ? 'DA_THANH_TOAN' : 'CHO_THANH_TOAN');
+    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : (status === 'DA_THANH_TOAN' ? 'DA_THU_SAN' : 'CHO_THANH_TOAN');
 
     const meta = {
       paymentMethod,
@@ -258,7 +259,9 @@ app.post('/api/bookings', async (req, res) => {
       commissionStatus,
       services: req.body?.services || {},
       paidAmount: isCash ? 0 : bookingTotal,
-      remainingAmount: isCash ? bookingTotal : 0
+      remainingAmount: isCash ? bookingTotal : 0,
+      financialMode: 'DEMO',
+      isSimulatedPayment: !isCash
     };
 
     await adminSupabase.from('datsan').update({
@@ -298,7 +301,7 @@ app.post('/api/bookings', async (req, res) => {
         await adminSupabase.from('thongbao').insert({
           manguoidung: makhachhang,
           tieude: '🎉 Đặt sân thành công!',
-          noidung: `Bạn đã đặt sân ${sanName} ngày ${date} thành công. Hình thức: ${isCash ? 'Tiền mặt tại sân' : 'VietQR 100%'}. Vui lòng đến trước 10 phút.`,
+          noidung: `Bạn đã đặt sân ${sanName} ngày ${date} thành công. Hình thức: ${isCash ? 'Tiền mặt tại sân' : 'Thanh toán trực tuyến mô phỏng (DEMO 100%)'}. Vui lòng đến trước 10 phút.`,
           loaithongbao: 'BOOKING'
         });
         console.log(`[Notification] Dispatched booking confirmation notification to customer ID ${makhachhang} for booking ${madatsan}`);
@@ -309,7 +312,7 @@ app.post('/api/bookings', async (req, res) => {
         await adminSupabase.from('thongbao').insert({
           manguoidung: ownerId,
           tieude: '🔔 Đơn đặt sân mới!',
-          noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Đã thanh toán VietQR'}).`,
+          noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Đã thanh toán mô phỏng DEMO'}).`,
           loaithongbao: 'BOOKING'
         });
       }
@@ -317,8 +320,8 @@ app.post('/api/bookings', async (req, res) => {
       // 3. Thông báo cho Super Admin
       await adminSupabase.from('thongbao').insert({
         manguoidung: null, // Broadcast hoặc Admin
-        tieude: '📋 Đơn đặt sân mới toàn sàn',
-        noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod}).`,
+        tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
+        noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod} - Mô phỏng DEMO).`,
         loaithongbao: 'ADMIN'
       });
     } catch (notifErr) {
@@ -438,7 +441,7 @@ app.post('/api/owner/settle-booking', async (req, res) => {
           return res.status(400).json({ error: 'Không thể xác nhận đơn đặt sân đã bị hủy.' });
         }
         if (currentStatus === 'DA_THANH_TOAN') {
-          return res.status(400).json({ error: 'Đơn đặt sân đã được thanh toán trực tuyến qua VietQR, không thể thu tiền mặt.' });
+          return res.status(400).json({ error: 'Đơn đặt sân đã được thanh toán trực tuyến mô phỏng (DEMO), không thể thu tiền mặt.' });
         }
 
         meta.paymentMethod = 'TIEN_MAT';
@@ -488,7 +491,7 @@ app.post('/api/owner/settle-booking', async (req, res) => {
         }
         if (currentStatus === 'DA_THANH_TOAN') {
           console.warn(`[Security Alert] Rejected illegal cancellation attempt by Owner ${callerUserId} on ONLINE-PAID booking ${bookingId}`);
-          return res.status(400).json({ error: 'Không thể hủy đơn đặt sân đã thanh toán trực tuyến (VietQR 100%) qua chức năng vắng mặt.' });
+          return res.status(400).json({ error: 'Không thể hủy đơn đặt sân đã thanh toán trực tuyến mô phỏng (DEMO 100%) qua chức năng vắng mặt.' });
         }
         if (currentStatus === 'DA_HUY' || currentStatus === 'DAHUY') {
           return res.status(400).json({ error: 'Đơn đặt sân này đã được hủy trước đó.' });
@@ -580,8 +583,8 @@ app.post('/api/owner/settle-booking', async (req, res) => {
         // Thông báo cho Admin
         await adminSupabase.from('thongbao').insert({
           manguoidung: null, // Admin
-          tieude: '💰 Chủ sân đã nộp hoa hồng',
-          noidung: `Chủ sân ${ownerName} vừa quyết toán nộp ${totalSettledAmount.toLocaleString('vi-VN')} đ tiền hoa hồng qua VietQR MBBank.`,
+          tieude: '💰 Chủ sân đã nộp hoa hồng (DEMO)',
+          noidung: `Chủ sân ${ownerName} vừa quyết toán nộp ${totalSettledAmount.toLocaleString('vi-VN')} đ tiền hoa hồng qua Cổng thanh toán mô phỏng DEMO.`,
           loaithongbao: 'ADMIN'
         });
       } catch (err) {
@@ -940,8 +943,8 @@ async function autoSendOverdueDebtReminders() {
         const pitchListStr = Array.from(info.pitchNames).join(', ');
         await adminSupabase.from('thongbao').insert({
           manguoidung: ownerId,
-          tieude: '⚠️ [Tự động] Nhắc nộp hoa hồng quá hạn 1 tuần',
-          noidung: `Hệ thống DatSanOnline phát hiện bạn có ${info.count} đơn tiền mặt tại ${pitchListStr || 'sân'} đã hoàn thành hơn 7 ngày với tổng nợ hoa hồng 10% là ${info.total.toLocaleString('vi-VN')} đ chưa thanh toán. Vui lòng vào trang Quản Lý Sân quét mã VietQR để thanh toán cho sàn tránh bị gián đoạn hoạt động sân.`,
+          tieude: '⚠️ [Tự động] Nhắc nộp hoa hồng quá hạn 1 tuần (DEMO)',
+          noidung: `Hệ thống DatSanOnline phát hiện bạn có ${info.count} đơn tiền mặt tại ${pitchListStr || 'sân'} đã hoàn thành hơn 7 ngày với tổng nợ hoa hồng 10% là ${info.total.toLocaleString('vi-VN')} đ chưa thanh toán. Vui lòng vào trang Quản Lý Sân để quyết toán mô phỏng (DEMO) cho sàn tránh bị gián đoạn hoạt động sân.`,
           loaithongbao: 'REMINDER'
         });
         console.log(`[Auto Reminder] Đã tự động gửi thông báo nhắc nợ quá hạn 1 tuần tới chủ sân ID ${ownerId} (${info.total.toLocaleString('vi-VN')} đ)`);

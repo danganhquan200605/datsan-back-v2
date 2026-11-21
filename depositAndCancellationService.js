@@ -5,22 +5,44 @@
 
 const { Pool } = require('pg');
 
-const localPool = new Pool({
-  host: process.env.PGHOST || 'localhost',
-  port: Number(process.env.PGPORT || 5432),
-  user: process.env.PGUSER || 'postgres',
-  password: process.env.PGPASSWORD || 'postgres',
-  database: process.env.LOCAL_DB_NAME || 'datsan_local_testbed',
-  max: 20, // Increased for concurrent load testing
-  idleTimeoutMillis: 30000
-});
+const isRenderProd = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID) || (process.env.NODE_ENV === 'production' && process.env.IS_LOCAL !== 'true');
+
+let poolConfig;
+if (process.env.DATABASE_URL) {
+  // Remote PostgreSQL (Supabase / Render Managed Postgres / External Pooler)
+  poolConfig = {
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+    max: 20,
+    idleTimeoutMillis: 30000
+  };
+} else if (isRenderProd) {
+  // On Render Production, if DATABASE_URL is missing, fail fast with clear configuration error!
+  throw new Error('[FATAL_DB_POOL] Production Render environment detected but DATABASE_URL is not configured. Refusing fallback to localhost.');
+} else {
+  // Local development / testbed fallback
+  poolConfig = {
+    host: process.env.PGHOST || 'localhost',
+    port: Number(process.env.PGPORT || 5432),
+    user: process.env.PGUSER || 'postgres',
+    password: process.env.PGPASSWORD || 'postgres',
+    database: process.env.LOCAL_DB_NAME || 'datsan_local_testbed',
+    max: 20,
+    idleTimeoutMillis: 30000
+  };
+}
+
+const localPool = new Pool(poolConfig);
 
 // ============================================================================
 // FINANCIAL MODE & CONFIGURATION (DEMO SIMULATION GUARD)
 // ============================================================================
 
-const FINANCIAL_MODE = String(process.env.FINANCIAL_MODE || 'DEMO').trim().toUpperCase();
-const IS_DEMO_MODE = FINANCIAL_MODE === 'DEMO';
+const FINANCIAL_MODE = String(process.env.FINANCIAL_MODE || '').trim().toUpperCase();
+if (FINANCIAL_MODE !== 'DEMO') {
+  throw new Error(`[FATAL_FINANCIAL_GUARD] FINANCIAL_MODE must be strictly 'DEMO' (got: "${process.env.FINANCIAL_MODE || ''}"). Real financial transactions are strictly blocked.`);
+}
+const IS_DEMO_MODE = true;
 
 /**
  * Sinh mã Mock QR SVG an toàn tuyệt đối cho Demo Mode
@@ -52,34 +74,17 @@ function getMockQrSvgDataUrl(amount, transferContent) {
 
 /**
  * Lấy cấu hình tài khoản ngân hàng ký quỹ của sàn từ biến môi trường
- * Ở chế độ DEMO: Trả về tài khoản mô phỏng rõ ràng, không sử dụng tài khoản thật
+ * Ở chế độ DEMO: Trả về tài khoản mô phỏng rõ ràng, tuyệt đối không sử dụng tài khoản thật
  */
 function getEscrowBankConfig() {
-  if (IS_DEMO_MODE) {
-    return {
-      bankId: '999999',
-      accountNumber: 'DEMO-88888888',
-      accountHolder: 'DATSANONLINE MO PHONG (KHONG CHUYEN TIEN THAT)',
-      bankName: 'NGAN HANG MO PHONG DATSAN',
-      financialMode: 'DEMO',
-      isSimulated: true
-    };
-  }
-
-  const bankId = String(process.env.ESCROW_BANK_ID || '970415').trim();
-  const accountNumber = String(process.env.ESCROW_ACCOUNT_NUMBER || '109876543210').trim();
-  const accountHolder = String(process.env.ESCROW_ACCOUNT_HOLDER || 'CONG TY DATSANONLINE ESCROW').trim();
-  const bankName = String(process.env.ESCROW_BANK_NAME || 'MOCK_VIETINBANK').trim();
-
-  // Kiểm tra định dạng hợp lệ
-  if (!/^\d{4,8}$/.test(bankId)) {
-    console.warn(`[ESCROW CONFIG WARNING] Invalid ESCROW_BANK_ID: ${bankId}. Format must be 4-8 digits.`);
-  }
-  if (!/^[0-9A-Za-z]{6,24}$/.test(accountNumber)) {
-    console.warn(`[ESCROW CONFIG WARNING] Invalid ESCROW_ACCOUNT_NUMBER: ${accountNumber}.`);
-  }
-
-  return { bankId, accountNumber, accountHolder, bankName, financialMode: 'LIVE', isSimulated: false };
+  return {
+    bankId: '999999',
+    accountNumber: 'DEMO-88888888',
+    accountHolder: 'DATSANONLINE MO PHONG (KHONG CHUYEN TIEN THAT)',
+    bankName: 'NGAN HANG MO PHONG DATSAN',
+    financialMode: 'DEMO',
+    isSimulated: true
+  };
 }
 
 // Utility: Financial Audit Logger (Bất biến)
@@ -158,7 +163,7 @@ async function getOrCreateOwnerDeposit(ownerId, isLegacy = false, adminSupabase 
 }
 
 /**
- * Tạo yêu cầu nộp ký quỹ 1.000.000đ và sinh VietQR
+ * Tạo yêu cầu nộp ký quỹ 1.000.000đ và sinh Mock QR (DEMO)
  */
 async function createDepositPaymentRequest(ownerId, customAmount = null) {
   const client = await localPool.connect();
@@ -178,15 +183,12 @@ async function createDepositPaymentRequest(ownerId, customAmount = null) {
 
     const amount = customAmount ? Number(customAmount) : Math.max(1000000 - currentBalance, 1000000);
     const requestId = `REQ_DEP_${ownerId}_${Date.now()}`;
-    const transferContent = `KYQUY ${ownerId} ${requestId.slice(-6)}`;
+    const transferContent = `KYQUY-DEMO-${ownerId}-${requestId.slice(-6)}`;
 
     // Lấy thông tin tài khoản ngân hàng từ ENV (CFG-PROD-01 & DEMO MODE)
     const escrowCfg = getEscrowBankConfig();
-    const qrUrl = IS_DEMO_MODE
-      ? getMockQrSvgDataUrl(amount, transferContent)
-      : `https://api.vietqr.io/image/${escrowCfg.bankId}-${escrowCfg.accountNumber}-compact2.png?amount=${amount}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(escrowCfg.accountHolder)}`;
-
-    const phuongThuc = IS_DEMO_MODE ? 'MOCK_GATEWAY' : 'VIETQR';
+    const qrUrl = getMockQrSvgDataUrl(amount, transferContent);
+    const phuongThuc = 'MOCK_GATEWAY';
     const gdRes = await client.query(`
       INSERT INTO kyquy_giaodich (ma_yeucau, machusan, sotien, noidung_chuyenkhoan, phuongthuc, trangthai)
       VALUES ($1, $2, $3, $4, $5, 'CHO_XAC_MINH')
@@ -356,7 +358,7 @@ async function adminVerifyDepositPayment(adminId, { requestId, isApproved, bankT
     await client.query(`
       INSERT INTO kyquy_ledger (machusan, magiaodich, loai_butdoan, sotien_thaydoi, sodu_sau, lydo, actor_id, actor_role)
       VALUES ($1, $2, $3, $4, $5, $6, $7, 'ADMIN')
-    `, [ownerId, gd.magiaodich, ledgerAction, amount, newBalance, 'Admin xác nhận tiền thực nhận vào tài khoản ký quỹ VietQR', adminId]);
+    `, [ownerId, gd.magiaodich, ledgerAction, amount, newBalance, 'Admin xác nhận tiền nộp ký quỹ mô phỏng DEMO', adminId]);
 
     // Cập nhật trạng thái tài khoản ký quỹ
     const newStatus = newBalance >= 1000000 ? 'DA_KY_QUY' : 'THIEU_KY_QUY';
@@ -798,7 +800,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
 
     let refundRecord = null;
 
-    // 10. Tạo yêu cầu hoàn tiền nếu đơn đã thanh toán online (VietQR 100%)
+    // 10. Tạo yêu cầu hoàn tiền nếu đơn đã thanh toán online mô phỏng (DEMO 100%)
     if (isOnlinePaid && totalAmount > 0) {
       const ownerId = booking.san?.machusan;
       const deadline = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
@@ -1720,8 +1722,8 @@ async function ownerTopUpEscrow(ownerId, amount, { bankTxId, autoVerify = true }
     const vRes = await adminVerifyDepositPayment(1, {
       requestId: reqId,
       isApproved: true,
-      bankTxId: bankTxId || 'TOPUP_VIETQR_' + Date.now(),
-      notes: 'Bổ sung ký quỹ thành công qua VietQR'
+      bankTxId: bankTxId || 'TOPUP_DEMO_' + Date.now(),
+      notes: 'Bổ sung ký quỹ thành công qua Cổng mô phỏng DEMO'
     });
     const dep = await getOrCreateOwnerDeposit(ownerId);
     return {
