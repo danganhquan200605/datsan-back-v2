@@ -256,7 +256,21 @@ app.post('/api/bookings', async (req, res) => {
       const { data: sanData } = await adminSupabase.from('san').select('tensan, machusan').eq('masan', masan).single();
       const sanName = sanData?.tensan || 'Sân thể thao';
       const ownerId = sanData?.machusan;
-      const makhachhang = data?.makhachhang || data?.MaKhachHang;
+
+      // P1 (BUG-02): Xác định makhachhang từ nguồn dữ liệu đáng tin cậy
+      let makhachhang = data?.makhachhang || data?.MaKhachHang;
+      if (!makhachhang && madatsan) {
+        const { data: bRow } = await adminSupabase.from('datsan').select('makhachhang').eq('madatsan', madatsan).single();
+        makhachhang = bRow?.makhachhang;
+      }
+      if (!makhachhang) {
+        const authData = await getAuthenticatedProfile(req);
+        makhachhang = authData?.profile?.MaNguoiDung ?? authData?.profile?.manguoidung ?? authData?.profile?.id;
+      }
+
+      if (typeof data === 'object' && data !== null) {
+        data.makhachhang = makhachhang;
+      }
 
       // 1. Thông báo cho Khách hàng
       if (makhachhang) {
@@ -266,6 +280,7 @@ app.post('/api/bookings', async (req, res) => {
           noidung: `Bạn đã đặt sân ${sanName} ngày ${date} thành công. Hình thức: ${isCash ? 'Tiền mặt tại sân' : 'VietQR 100%'}. Vui lòng đến trước 10 phút.`,
           loaithongbao: 'BOOKING'
         });
+        console.log(`[Notification] Dispatched booking confirmation notification to customer ID ${makhachhang} for booking ${madatsan}`);
       }
 
       // 2. Thông báo cho Chủ sân
@@ -391,11 +406,28 @@ app.post('/api/owner/settle-booking', async (req, res) => {
       let meta = {};
       try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
 
+      const currentStatus = String(booking.trangthai || '').toUpperCase();
+
       if (action === 'CONFIRM_CASH') {
+        // Kiểm tra tính hợp lệ của trạng thái trước khi xác nhận thu tiền
+        if (currentStatus === 'HOAN_THANH' || currentStatus === 'HOANTHANH') {
+          return res.status(400).json({ error: 'Đơn đặt sân này đã được hoàn tất thi đấu trước đó.' });
+        }
+        if (currentStatus === 'DA_HUY' || currentStatus === 'DAHUY') {
+          return res.status(400).json({ error: 'Không thể xác nhận đơn đặt sân đã bị hủy.' });
+        }
+        if (currentStatus === 'DA_THANH_TOAN') {
+          return res.status(400).json({ error: 'Đơn đặt sân đã được thanh toán trực tuyến qua VietQR, không thể thu tiền mặt.' });
+        }
+
         meta.paymentMethod = 'TIEN_MAT';
         meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
         meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
         meta.completedAt = new Date().toISOString();
+        meta.statusHistory = [
+          ...(meta.statusHistory || []),
+          { from: currentStatus, to: 'HOAN_THANH', action, by: callerUserId, role: authData.role, at: new Date().toISOString() }
+        ];
 
         const { data, error } = await adminSupabase.from('datsan').update({
           trangthai: 'HOAN_THANH',
@@ -403,6 +435,14 @@ app.post('/api/owner/settle-booking', async (req, res) => {
         }).eq('madatsan', bookingId).select().single();
 
         if (error) throw error;
+
+        // Cập nhật trạng thái bản ghi thanh toán
+        await adminSupabase.from('thanhtoan').update({
+          trangthai: 'DA_THANH_TOAN',
+          phuongthucthanhtoan: 'TIEN_MAT'
+        }).eq('madatsan', bookingId);
+
+        console.log(`[Audit Log] Owner ${callerUserId} confirmed cash collection for booking ${bookingId}: ${currentStatus} -> HOAN_THANH`);
 
         // Thông báo cho khách hàng
         try {
@@ -420,10 +460,31 @@ app.post('/api/owner/settle-booking', async (req, res) => {
       }
 
       if (action === 'CANCEL_NO_SHOW') {
+        // P0 (BUG-01): Chặn Owner hủy đơn đã hoàn thành hoặc đã thanh toán trực tuyến
+        if (currentStatus === 'HOAN_THANH' || currentStatus === 'HOANTHANH') {
+          console.warn(`[Security Alert] Rejected illegal cancellation attempt by Owner ${callerUserId} on COMPLETED booking ${bookingId}`);
+          return res.status(400).json({ error: 'Không thể hủy trận đấu đã hoàn tất thi đấu. Dữ liệu tài chính và hoa hồng đã được chốt an toàn.' });
+        }
+        if (currentStatus === 'DA_THANH_TOAN') {
+          console.warn(`[Security Alert] Rejected illegal cancellation attempt by Owner ${callerUserId} on ONLINE-PAID booking ${bookingId}`);
+          return res.status(400).json({ error: 'Không thể hủy đơn đặt sân đã thanh toán trực tuyến (VietQR 100%) qua chức năng vắng mặt.' });
+        }
+        if (currentStatus === 'DA_HUY' || currentStatus === 'DAHUY') {
+          return res.status(400).json({ error: 'Đơn đặt sân này đã được hủy trước đó.' });
+        }
+        if (currentStatus !== 'CHO_THI_DAU' && currentStatus !== 'CHOXACNHAN') {
+          return res.status(400).json({ error: `Không thể hủy đơn đặt sân ở trạng thái: ${currentStatus}` });
+        }
+
         meta.paymentMethod = 'TIEN_MAT';
         meta.commissionStatus = 'DA_HUY'; // Xóa sổ nợ hoa hồng
         meta.commissionAmount = 0;
         meta.cancelledAt = new Date().toISOString();
+        meta.cancelReason = 'NO_SHOW';
+        meta.statusHistory = [
+          ...(meta.statusHistory || []),
+          { from: currentStatus, to: 'DA_HUY', action, by: callerUserId, role: authData.role, at: new Date().toISOString(), reason: 'NO_SHOW' }
+        ];
 
         const { data, error } = await adminSupabase.from('datsan').update({
           trangthai: 'DA_HUY',
@@ -431,6 +492,26 @@ app.post('/api/owner/settle-booking', async (req, res) => {
         }).eq('madatsan', bookingId).select().single();
 
         if (error) throw error;
+
+        // Cập nhật trạng thái bản ghi thanh toán sang DA_HUY
+        await adminSupabase.from('thanhtoan').update({
+          trangthai: 'DA_HUY'
+        }).eq('madatsan', bookingId);
+
+        console.log(`[Audit Log] Owner ${callerUserId} cancelled no-show booking ${bookingId}: ${currentStatus} -> DA_HUY`);
+
+        // Gửi thông báo cho khách hàng
+        try {
+          if (booking.makhachhang) {
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: booking.makhachhang,
+              tieude: '❌ Đơn đặt sân đã bị hủy',
+              noidung: 'Chủ sân đã ghi nhận bạn vắng mặt (No-show) và hủy lịch thi đấu này.',
+              loaithongbao: 'BOOKING_CANCELLED'
+            });
+          }
+        } catch {}
+
         return res.json({ success: true, data });
       }
     }
