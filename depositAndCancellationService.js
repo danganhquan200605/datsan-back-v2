@@ -2315,38 +2315,64 @@ async function processMockPayment({
           meta.commissionStatus = 'DA_HUY';
 
           if (sb) {
-            const { data: updated, error: updErr } = await sb.from('datsan').update({
-              trangthai: 'DA_HUY',
-              ghichu: JSON.stringify(meta)
-            }).eq('madatsan', transactionId).eq('trangthai', 'CHO_THANH_TOAN').select();
+            // Priority: Call atomic PostgreSQL RPC function (executes in 1 single transaction)
+            let rpcSucceeded = false;
+            try {
+              const { data: rpcRes, error: rpcErr } = await sb.rpc('cancel_booking_atomic', {
+                p_madatsan: Number(transactionId),
+                p_ghichu: JSON.stringify(meta),
+                p_expected_status: 'CHO_THANH_TOAN'
+              });
 
-            if (updErr || !updated || updated.length === 0) {
-              await client.query('ROLLBACK');
-              return {
-                success: false,
-                code: 'CONCURRENT_CONFLICT',
-                message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
-              };
+              if (!rpcErr && rpcRes) {
+                rpcSucceeded = true;
+                if (!rpcRes.success) {
+                  await client.query('ROLLBACK');
+                  return {
+                    success: false,
+                    code: rpcRes.code || 'CONCURRENT_CONFLICT',
+                    message: rpcRes.message || 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+                  };
+                }
+              }
+            } catch (rpcEx) {
+              rpcSucceeded = false;
             }
 
-            // Giải phóng các khung giờ trong bảng chính thức datsan_khunggio
-            const { error: delErr } = await sb.from('datsan_khunggio').delete().eq('madatsan', transactionId);
-            if (delErr) {
-              // Hoàn tác trạng thái datsan để bảo đảm không xảy ra hủy một phần
-              await sb.from('datsan').update({
-                trangthai: booking.trangthai,
-                ghichu: booking.ghichu
-              }).eq('madatsan', transactionId);
-              await client.query('ROLLBACK');
-              return {
-                success: false,
-                code: 'RELEASE_SLOTS_FAILED',
-                message: 'Không thể giải phóng khung giờ đặt sân. Đã hoàn tác trạng thái để bảo đảm tính nhất quán dữ liệu.'
-              };
-            }
+            if (!rpcSucceeded) {
+              const { data: updated, error: updErr } = await sb.from('datsan').update({
+                trangthai: 'DA_HUY',
+                ghichu: JSON.stringify(meta)
+              }).eq('madatsan', transactionId).eq('trangthai', 'CHO_THANH_TOAN').select();
 
-            // Đồng bộ trạng thái thanhtoan nếu có
-            await sb.from('thanhtoan').update({ trangthai: 'DA_HUY' }).eq('madatsan', transactionId);
+              if (updErr || !updated || updated.length === 0) {
+                await client.query('ROLLBACK');
+                return {
+                  success: false,
+                  code: 'CONCURRENT_CONFLICT',
+                  message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+                };
+              }
+
+              // Giải phóng các khung giờ trong bảng chính thức datsan_khunggio
+              const { error: delErr } = await sb.from('datsan_khunggio').delete().eq('madatsan', transactionId);
+              if (delErr) {
+                // Hoàn tác trạng thái datsan để bảo đảm không xảy ra hủy một phần
+                await sb.from('datsan').update({
+                  trangthai: booking.trangthai,
+                  ghichu: booking.ghichu
+                }).eq('madatsan', transactionId);
+                await client.query('ROLLBACK');
+                return {
+                  success: false,
+                  code: 'RELEASE_SLOTS_FAILED',
+                  message: 'Không thể giải phóng khung giờ đặt sân. Đã hoàn tác trạng thái để bảo đảm tính nhất quán dữ liệu.'
+                };
+              }
+
+              // Đồng bộ trạng thái thanhtoan nếu có
+              await sb.from('thanhtoan').update({ trangthai: 'DA_HUY' }).eq('madatsan', transactionId);
+            }
           } else {
             const updRes = await client.query(`
               UPDATE datsan
