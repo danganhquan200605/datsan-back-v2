@@ -91,14 +91,53 @@ function validateEnvironmentConfig(env = process.env) {
 
   const isProd = isProductionRender(env);
 
-  // Requirement 6: Do not apply Staging-only rule to Production Render
+  // Requirement 6 & Production Safety: On Production Render, verify connections point to Production Project Ref
   if (isProd) {
+    const prodSupabaseUrl = String(env.SUPABASE_URL || '').trim();
+    const prodDatabaseUrl = String(env.DATABASE_URL || '').trim();
+
+    // Check SUPABASE_URL if provided
+    if (prodSupabaseUrl) {
+      const ref = extractProjectRefFromUrl(prodSupabaseUrl);
+      if (ref && ref !== PRODUCTION_PROJECT_REF) {
+        return {
+          ok: false,
+          code: 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH',
+          mode: 'PRODUCTION_RENDER',
+          error: `PRODUCTION_SUPABASE_URL_MISMATCH: Production Render SUPABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${ref}"! Startup aborted.`
+        };
+      }
+    }
+
+    // Check DATABASE_URL if provided
+    if (prodDatabaseUrl) {
+      const ref = extractProjectRefFromUrl(prodDatabaseUrl);
+      if (ref && ref !== PRODUCTION_PROJECT_REF) {
+        return {
+          ok: false,
+          code: 'ERR_PRODUCTION_DATABASE_URL_MISMATCH',
+          mode: 'PRODUCTION_RENDER',
+          error: `PRODUCTION_DATABASE_URL_MISMATCH: Production Render DATABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${ref}"! Startup aborted.`
+        };
+      }
+    }
+
+    // Never allow Staging Ref on Production Render
+    if (prodSupabaseUrl.includes(STAGING_PROJECT_REF) || prodDatabaseUrl.includes(STAGING_PROJECT_REF)) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_POINTING_TO_STAGING',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_POINTING_TO_STAGING: Production Render environment cannot point to Staging Project Ref (${STAGING_PROJECT_REF})! Startup aborted.`
+      };
+    }
+
     return {
       ok: true,
       mode: 'PRODUCTION_RENDER',
       isProduction: true,
       stagingRef: null,
-      message: 'Running in Production Render environment. Production database connection authorized.'
+      message: `Running in Production Render environment. Production database connection authorized to ${PRODUCTION_PROJECT_REF}.`
     };
   }
 

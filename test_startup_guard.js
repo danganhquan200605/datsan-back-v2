@@ -275,6 +275,38 @@ assert(prodRenderRes.ok === true, 'Production Render allowed to connect to Produ
 assert(prodRenderRes.mode === 'PRODUCTION_RENDER', 'Mode is PRODUCTION_RENDER');
 assert(prodRenderRes.isProduction === true, 'isProduction flag is true');
 
+// 7b. Production Render safety: verify SUPABASE_URL & DATABASE_URL point to Production Project Ref
+const prodRenderWithDbEnv = {
+  ...prodRenderEnv,
+  DATABASE_URL: `postgresql://postgres.${PRODUCTION_PROJECT_REF}:secret@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres`
+};
+const prodRenderWithDbRes = validateEnvironmentConfig(prodRenderWithDbEnv);
+assert(prodRenderWithDbRes.ok === true, 'Production Render with valid Production DATABASE_URL authorized');
+
+// 7c. Production Render rejected if SUPABASE_URL points to Staging
+const prodRenderStagingUrlEnv = {
+  ...prodRenderEnv,
+  SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`
+};
+const prodRenderStagingUrlRes = validateEnvironmentConfig(prodRenderStagingUrlEnv);
+assert(prodRenderStagingUrlRes.ok === false, 'Production Render rejected when SUPABASE_URL points to Staging');
+assert(
+  prodRenderStagingUrlRes.code === 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH' || prodRenderStagingUrlRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING',
+  'Code indicates Staging mismatch on Production Render'
+);
+
+// 7d. Production Render rejected if DATABASE_URL points to Staging
+const prodRenderStagingDbEnv = {
+  ...prodRenderEnv,
+  DATABASE_URL: `postgresql://postgres.${STAGING_PROJECT_REF}:secret@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres`
+};
+const prodRenderStagingDbRes = validateEnvironmentConfig(prodRenderStagingDbEnv);
+assert(prodRenderStagingDbRes.ok === false, 'Production Render rejected when DATABASE_URL points to Staging');
+assert(
+  prodRenderStagingDbRes.code === 'ERR_PRODUCTION_DATABASE_URL_MISMATCH' || prodRenderStagingDbRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING',
+  'Code indicates DB Staging mismatch on Production Render'
+);
+
 // --------------------------------------------------------------------------
 // 8. PROCESS INTEGRATION TESTS: REAL CHILD PROCESS EXECUTION
 // --------------------------------------------------------------------------

@@ -249,8 +249,9 @@ app.post('/api/bookings', async (req, res) => {
     const commissionAmount = Math.round(bookingTotal * 0.1); // 10% hoa hồng sàn
     const isCash = paymentMethod === 'TIEN_MAT';
     const isMockPayment = paymentMethod === 'QR' || paymentMethod === 'MOCK_GATEWAY';
-    const status = isCash ? 'CHO_THI_DAU' : (isMockPayment ? 'DA_THANH_TOAN' : 'CHO_THANH_TOAN');
-    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : (status === 'DA_THANH_TOAN' ? 'DA_THU_SAN' : 'CHO_THANH_TOAN');
+    const simulateInstant = req.body?.simulateInstant === true && req.body?.simulationAction === 'SIMULATE_SUCCESS';
+    const status = isCash ? 'CHO_THI_DAU' : (simulateInstant ? 'DA_THANH_TOAN' : 'CHO_THANH_TOAN');
+    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : (simulateInstant ? 'DA_THU_SAN' : 'CHO_THANH_TOAN');
 
     const meta = {
       paymentMethod,
@@ -258,11 +259,16 @@ app.post('/api/bookings', async (req, res) => {
       commissionAmount,
       commissionStatus,
       services: req.body?.services || {},
-      paidAmount: isCash ? 0 : bookingTotal,
-      remainingAmount: isCash ? bookingTotal : 0,
+      paidAmount: simulateInstant ? bookingTotal : 0,
+      remainingAmount: simulateInstant ? 0 : bookingTotal,
       financialMode: 'DEMO',
-      isSimulatedPayment: !isCash
+      isSimulatedPayment: simulateInstant
     };
+
+    if (simulateInstant) {
+      meta.mockBankTx = `MOCK_TX_${Date.now()}_${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+      meta.paymentSimulatedAt = new Date().toISOString();
+    }
 
     await adminSupabase.from('datsan').update({
       trangthai: status,
@@ -275,57 +281,59 @@ app.post('/api/bookings', async (req, res) => {
       data.phuongthuc = paymentMethod;
     }
 
-    // Gửi thông báo hệ thống tự động cho Khách hàng, Chủ sân và Admin
-    try {
-      const { data: sanData } = await adminSupabase.from('san').select('tensan, machusan').eq('masan', masan).single();
-      const sanName = sanData?.tensan || 'Sân thể thao';
-      const ownerId = sanData?.machusan;
+    // Gửi thông báo hệ thống tự động cho Khách hàng, Chủ sân và Admin khi đơn đã thanh toán hoặc tiền mặt
+    if (isCash || simulateInstant) {
+      try {
+        const { data: sanData } = await adminSupabase.from('san').select('tensan, machusan').eq('masan', masan).single();
+        const sanName = sanData?.tensan || 'Sân thể thao';
+        const ownerId = sanData?.machusan;
 
-      // P1 (BUG-02): Xác định makhachhang từ nguồn dữ liệu đáng tin cậy
-      let makhachhang = data?.makhachhang || data?.MaKhachHang;
-      if (!makhachhang && madatsan) {
-        const { data: bRow } = await adminSupabase.from('datsan').select('makhachhang').eq('madatsan', madatsan).single();
-        makhachhang = bRow?.makhachhang;
-      }
-      if (!makhachhang) {
-        const authData = await getAuthenticatedProfile(req);
-        makhachhang = authData?.profile?.MaNguoiDung ?? authData?.profile?.manguoidung ?? authData?.profile?.id;
-      }
+        // P1 (BUG-02): Xác định makhachhang từ nguồn dữ liệu đáng tin cậy
+        let makhachhang = data?.makhachhang || data?.MaKhachHang;
+        if (!makhachhang && madatsan) {
+          const { data: bRow } = await adminSupabase.from('datsan').select('makhachhang').eq('madatsan', madatsan).single();
+          makhachhang = bRow?.makhachhang;
+        }
+        if (!makhachhang) {
+          const authData = await getAuthenticatedProfile(req);
+          makhachhang = authData?.profile?.MaNguoiDung ?? authData?.profile?.manguoidung ?? authData?.profile?.id;
+        }
 
-      if (typeof data === 'object' && data !== null) {
-        data.makhachhang = makhachhang;
-      }
+        if (typeof data === 'object' && data !== null) {
+          data.makhachhang = makhachhang;
+        }
 
-      // 1. Thông báo cho Khách hàng
-      if (makhachhang) {
+        // 1. Thông báo cho Khách hàng
+        if (makhachhang) {
+          await adminSupabase.from('thongbao').insert({
+            manguoidung: makhachhang,
+            tieude: '🎉 Đặt sân thành công!',
+            noidung: `Bạn đã đặt sân ${sanName} ngày ${date} thành công. Hình thức: ${isCash ? 'Tiền mặt tại sân' : 'Thanh toán trực tuyến mô phỏng (DEMO 100%)'}. Vui lòng đến trước 10 phút.`,
+            loaithongbao: 'BOOKING'
+          });
+          console.log(`[Notification] Dispatched booking confirmation notification to customer ID ${makhachhang} for booking ${madatsan}`);
+        }
+
+        // 2. Thông báo cho Chủ sân
+        if (ownerId) {
+          await adminSupabase.from('thongbao').insert({
+            manguoidung: ownerId,
+            tieude: '🔔 Đơn đặt sân mới!',
+            noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Đã thanh toán mô phỏng DEMO'}).`,
+            loaithongbao: 'BOOKING'
+          });
+        }
+
+        // 3. Thông báo cho Super Admin
         await adminSupabase.from('thongbao').insert({
-          manguoidung: makhachhang,
-          tieude: '🎉 Đặt sân thành công!',
-          noidung: `Bạn đã đặt sân ${sanName} ngày ${date} thành công. Hình thức: ${isCash ? 'Tiền mặt tại sân' : 'Thanh toán trực tuyến mô phỏng (DEMO 100%)'}. Vui lòng đến trước 10 phút.`,
-          loaithongbao: 'BOOKING'
+          manguoidung: null, // Broadcast hoặc Admin
+          tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
+          noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod} - Mô phỏng DEMO).`,
+          loaithongbao: 'ADMIN'
         });
-        console.log(`[Notification] Dispatched booking confirmation notification to customer ID ${makhachhang} for booking ${madatsan}`);
+      } catch (notifErr) {
+        console.warn('Lỗi ghi thông báo khi đặt sân:', notifErr.message);
       }
-
-      // 2. Thông báo cho Chủ sân
-      if (ownerId) {
-        await adminSupabase.from('thongbao').insert({
-          manguoidung: ownerId,
-          tieude: '🔔 Đơn đặt sân mới!',
-          noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Đã thanh toán mô phỏng DEMO'}).`,
-          loaithongbao: 'BOOKING'
-        });
-      }
-
-      // 3. Thông báo cho Super Admin
-      await adminSupabase.from('thongbao').insert({
-        manguoidung: null, // Broadcast hoặc Admin
-        tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
-        noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod} - Mô phỏng DEMO).`,
-        loaithongbao: 'ADMIN'
-      });
-    } catch (notifErr) {
-      console.warn('Lỗi ghi thông báo khi đặt sân:', notifErr.message);
     }
   }
 

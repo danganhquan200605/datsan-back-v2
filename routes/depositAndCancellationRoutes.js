@@ -42,7 +42,7 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
     const actorId = authData.profile?.manguoidung || authData.profile?.MaNguoiDung;
     const actorRole = authData.profile?.vaitro || authData.profile?.VaiTro;
 
-    const { transactionType, transactionId, simulationAction, idempotencyKey } = req.body;
+    const { transactionType, transactionId, simulationAction, fallbackAction, idempotencyKey } = req.body;
 
     if (!transactionType || !transactionId || !simulationAction) {
       return res.status(400).json({ error: 'Thiếu thông tin bắt buộc: transactionType, transactionId, simulationAction' });
@@ -55,8 +55,10 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
         transactionType,
         transactionId: Number(transactionId),
         simulationAction,
+        fallbackAction,
         idempotencyKey,
-        ipAddress: req.ip
+        ipAddress: req.ip,
+        adminSupabase
       });
 
       if (!result.success && result.code === 'FORBIDDEN') {

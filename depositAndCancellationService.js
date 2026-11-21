@@ -4,6 +4,16 @@
 // VERSION 2.0.0 - Remediated for BUG-SEC-01, GAP-FIN-01, ARCH-SEC-01, CFG-PROD-01, GAP-FIN-02
 
 const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js');
+
+let internalAdminSupabase = null;
+if (process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY)) {
+  internalAdminSupabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
+    { auth: { persistSession: false } }
+  );
+}
 
 const isRenderProd = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID) || (process.env.NODE_ENV === 'production' && process.env.IS_LOCAL !== 'true');
 
@@ -1829,11 +1839,13 @@ async function calculateOwnerFinancialSummary(ownerId) {
 async function processMockPayment({
   actorId,
   actorRole,
-  transactionType, // 'ESCROW_DEPOSIT' | 'REFUND'
-  transactionId,   // magiaodich hoặc mahoantien
+  transactionType, // 'ESCROW_DEPOSIT' | 'REFUND' | 'BOOKING'
+  transactionId,   // magiaodich hoặc mahoantien hoặc madatsan
   simulationAction, // 'SIMULATE_SUCCESS' | 'SIMULATE_FAILURE' | 'SIMULATE_PENDING'
+  fallbackAction = null, // 'SWITCH_CASH' | 'CANCEL' | 'RETRY'
   idempotencyKey = null,
-  ipAddress = '127.0.0.1'
+  ipAddress = '127.0.0.1',
+  adminSupabase = null
 }) {
   const client = await localPool.connect();
   try {
@@ -2061,6 +2073,269 @@ async function processMockPayment({
       } else {
         await client.query('ROLLBACK');
         return { success: false, code: 'SIMULATE_REFUND_FAILED', message: 'Mô phỏng hoàn tiền thất bại.' };
+      }
+    } else if (transactionType === 'BOOKING') {
+      const sb = adminSupabase || internalAdminSupabase;
+      let booking;
+
+      if (sb) {
+        const { data: bData, error: bErr } = await sb
+          .from('datsan')
+          .select('*, san(masan, machusan, tensan)')
+          .eq('madatsan', transactionId)
+          .single();
+        if (bErr || !bData) {
+          await client.query('ROLLBACK');
+          return { success: false, code: 'NOT_FOUND', message: 'Không tìm thấy đơn đặt sân #' + transactionId };
+        }
+        booking = bData;
+      } else {
+        const bRes = await client.query('SELECT * FROM datsan WHERE madatsan = $1 FOR UPDATE', [transactionId]);
+        if (bRes.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return { success: false, code: 'NOT_FOUND', message: 'Không tìm thấy đơn đặt sân #' + transactionId };
+        }
+        booking = bRes.rows[0];
+      }
+
+      // Anti-IDOR: Must be the customer who created booking or an ADMIN
+      if (Number(booking.makhachhang) !== Number(actorId) && actorRole !== 'ADMIN') {
+        await client.query('ROLLBACK');
+        return { success: false, code: 'FORBIDDEN', message: 'Bạn không có quyền thực hiện mô phỏng thanh toán cho đơn đặt sân của khách hàng khác (Chống IDOR).' };
+      }
+
+      // Idempotency: Already paid
+      if (booking.trangthai === 'DA_THANH_TOAN') {
+        await client.query('COMMIT');
+        return {
+          success: true,
+          code: 'IDEMPOTENT_ALREADY_SUCCESS',
+          status: 'DA_THANH_TOAN',
+          message: 'Đơn đặt sân này đã được thanh toán mô phỏng thành công trước đó.',
+          booking,
+          isSimulated: true
+        };
+      }
+
+      // Check if cancelled
+      if (booking.trangthai === 'DA_HUY' || booking.trangthai === 'DAHUY') {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          code: 'INVALID_STATUS',
+          message: 'Đơn đặt sân đã bị hủy, không thể thực hiện mô phỏng thanh toán.'
+        };
+      }
+
+      let meta = {};
+      try {
+        meta = typeof booking.ghichu === 'string' ? JSON.parse(booking.ghichu || '{}') : (booking.ghichu || {});
+      } catch (e) {
+        meta = {};
+      }
+      const totalAmount = Number(booking.tongtien || 0);
+      const commissionAmount = Math.round(totalAmount * 0.1);
+
+      if (simulationAction === 'SIMULATE_SUCCESS') {
+        const mockBankTx = `MOCK_BOOKING_TX_${Date.now()}_${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+        meta.paidAmount = totalAmount;
+        meta.remainingAmount = 0;
+        meta.commissionStatus = 'DA_THU_SAN';
+        meta.commissionAmount = commissionAmount;
+        meta.isSimulatedPayment = true;
+        meta.financialMode = 'DEMO';
+        meta.mockBankTx = mockBankTx;
+        meta.paymentSimulatedAt = new Date().toISOString();
+
+        if (sb) {
+          await sb.from('datsan').update({
+            trangthai: 'DA_THANH_TOAN',
+            ghichu: JSON.stringify(meta)
+          }).eq('madatsan', transactionId);
+        } else {
+          await client.query(`
+            UPDATE datsan
+            SET trangthai = 'DA_THANH_TOAN',
+                ghichu = $1
+            WHERE madatsan = $2
+          `, [JSON.stringify(meta), transactionId]);
+        }
+
+        await logFinancialAudit(client, {
+          actorId,
+          actorRole,
+          action: 'MOCK_PAYMENT_BOOKING_SUCCESS',
+          entityType: 'DATSAN',
+          entityId: transactionId,
+          oldValues: { trangthai: booking.trangthai, paidAmount: meta.paidAmount },
+          newValues: { trangthai: 'DA_THANH_TOAN', paidAmount: totalAmount, mockBankTx },
+          reason: 'Khách hàng mô phỏng thanh toán trực tuyến đơn đặt sân thành công (DEMO)',
+          ipAddress
+        });
+
+        await client.query('COMMIT');
+
+        // Gửi thông báo cho Khách hàng, Chủ sân, Admin nếu có sb
+        if (sb) {
+          try {
+            const sanName = booking.san?.tensan || 'Sân thể thao';
+            const ownerId = booking.san?.machusan;
+
+            await sb.from('thongbao').insert([
+              {
+                manguoidung: booking.makhachhang,
+                tieude: '🎉 Thanh toán mô phỏng thành công!',
+                noidung: `Bạn đã thanh toán mô phỏng (DEMO 100%) đơn đặt sân ${sanName} ngày ${booking.ngaysudung}. Mã GD: ${mockBankTx}.`,
+                loaithongbao: 'BOOKING'
+              },
+              ...(ownerId ? [{
+                manguoidung: ownerId,
+                tieude: '🔔 Đơn đặt sân mới (Mô phỏng)!',
+                noidung: `Khách hàng vừa hoàn tất thanh toán mô phỏng (DEMO 100%) cho sân ${sanName} ngày ${booking.ngaysudung}.`,
+                loaithongbao: 'BOOKING'
+              }] : []),
+              {
+                manguoidung: null,
+                tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
+                noidung: `Khách đã thanh toán mô phỏng đơn #${transactionId} tại sân ${sanName} - ${totalAmount.toLocaleString('vi-VN')} đ (DEMO).`,
+                loaithongbao: 'ADMIN'
+              }
+            ]);
+          } catch (notifErr) {
+            console.warn('[Notification Error]', notifErr.message);
+          }
+        }
+
+        return {
+          success: true,
+          code: 'SIMULATE_SUCCESS',
+          status: 'DA_THANH_TOAN',
+          message: 'Mô phỏng thanh toán đơn đặt sân 100% THÀNH CÔNG! Trạng thái đơn: ĐÃ THANH TOÁN (DA_THANH_TOAN).',
+          isSimulated: true,
+          mockBankTx,
+          paidAmount: totalAmount,
+          bookingId: transactionId
+        };
+      } else if (simulationAction === 'SIMULATE_FAILURE') {
+        if (fallbackAction === 'SWITCH_CASH') {
+          // Khách hàng chọn chuyển sang thanh toán tiền mặt tại sân để không làm mất đặt sân
+          meta.paymentMethod = 'TIEN_MAT';
+          meta.paidAmount = 0;
+          meta.remainingAmount = totalAmount;
+          meta.commissionStatus = 'CHO_XAC_NHAN_TRAN';
+          meta.commissionAmount = commissionAmount;
+          meta.financialMode = 'DEMO';
+          meta.isSimulatedPayment = false;
+          meta.lastSimulation = { action: 'FAILURE_SWITCHED_CASH', at: new Date().toISOString() };
+
+          if (sb) {
+            await sb.from('datsan').update({
+              trangthai: 'CHO_THI_DAU',
+              ghichu: JSON.stringify(meta)
+            }).eq('madatsan', transactionId);
+          } else {
+            await client.query(`
+              UPDATE datsan
+              SET trangthai = 'CHO_THI_DAU',
+                  ghichu = $1
+              WHERE madatsan = $2
+            `, [JSON.stringify(meta), transactionId]);
+          }
+
+          await logFinancialAudit(client, {
+            actorId,
+            actorRole,
+            action: 'MOCK_PAYMENT_BOOKING_SWITCH_CASH',
+            entityType: 'DATSAN',
+            entityId: transactionId,
+            oldValues: { trangthai: booking.trangthai },
+            newValues: { trangthai: 'CHO_THI_DAU', paymentMethod: 'TIEN_MAT' },
+            reason: 'Mô phỏng thanh toán thất bại: Chuyển sang thanh toán tiền mặt tại sân (bảo toàn khung giờ)',
+            ipAddress
+          });
+
+          await client.query('COMMIT');
+          return {
+            success: true,
+            code: 'SIMULATE_FAILURE_SWITCHED_CASH',
+            status: 'CHO_THI_DAU',
+            message: 'Mô phỏng thất bại: Đơn đặt sân đã chuyển sang hình thức TIỀN MẶT TẠI SÂN (CHO_THI_DAU). Khung giờ của bạn được bảo toàn.',
+            isSimulated: true,
+            bookingId: transactionId
+          };
+        } else if (fallbackAction === 'CANCEL') {
+          // Hủy đơn đặt sân để không chiếm khung giờ khi mô phỏng thất bại
+          meta.lastSimulation = { action: 'FAILURE_CANCELLED', at: new Date().toISOString() };
+          meta.commissionAmount = 0;
+          meta.commissionStatus = 'DA_HUY';
+
+          if (sb) {
+            await sb.from('datsan').update({
+              trangthai: 'DA_HUY',
+              ghichu: JSON.stringify(meta)
+            }).eq('madatsan', transactionId);
+            await sb.from('chitietdatsan').delete().eq('madatsan', transactionId);
+          } else {
+            await client.query(`
+              UPDATE datsan
+              SET trangthai = 'DA_HUY',
+                  ghichu = $1
+              WHERE madatsan = $2
+            `, [JSON.stringify(meta), transactionId]);
+            await client.query(`DELETE FROM chitietdatsan WHERE madatsan = $1`, [transactionId]);
+          }
+
+          await logFinancialAudit(client, {
+            actorId,
+            actorRole,
+            action: 'MOCK_PAYMENT_BOOKING_CANCELLED',
+            entityType: 'DATSAN',
+            entityId: transactionId,
+            oldValues: { trangthai: booking.trangthai },
+            newValues: { trangthai: 'DA_HUY' },
+            reason: 'Mô phỏng thanh toán thất bại: Hủy đơn và giải phóng khung giờ thi đấu',
+            ipAddress
+          });
+
+          await client.query('COMMIT');
+          return {
+            success: true,
+            code: 'SIMULATE_FAILURE_CANCELLED',
+            status: 'DA_HUY',
+            message: 'Mô phỏng thất bại: Đơn đặt sân đã bị hủy và khung giờ thi đấu đã được giải phóng.',
+            isSimulated: true,
+            bookingId: transactionId
+          };
+        } else {
+          // Mặc định: giữ nguyên ở CHO_THANH_TOAN để người dùng có thể Thử lại, Chuyển tiền mặt hoặc Hủy
+          meta.lastSimulation = { action: 'SIMULATE_FAILURE', at: new Date().toISOString() };
+
+          if (sb) {
+            await sb.from('datsan').update({
+              ghichu: JSON.stringify(meta)
+            }).eq('madatsan', transactionId);
+          } else {
+            await client.query(`
+              UPDATE datsan
+              SET ghichu = $1
+              WHERE madatsan = $2
+            `, [JSON.stringify(meta), transactionId]);
+          }
+
+          await client.query('COMMIT');
+          return {
+            success: false,
+            code: 'SIMULATE_FAILURE',
+            status: 'CHO_THANH_TOAN',
+            message: 'Mô phỏng thanh toán thất bại. Đơn đặt sân vẫn được giữ tạm ở trạng thái Chờ thanh toán. Bạn có thể Thử lại, Chuyển sang tiền mặt (để không mất sân), hoặc Hủy đơn (để giải phóng khung giờ).',
+            isSimulated: true,
+            options: ['RETRY', 'SWITCH_CASH', 'CANCEL'],
+            bookingId: transactionId
+          };
+        }
+      } else {
+        await client.query('ROLLBACK');
+        return { success: false, code: 'INVALID_SIMULATION_ACTION', message: `simulationAction không hợp lệ cho booking: ${simulationAction}` };
       }
     } else {
       await client.query('ROLLBACK');
