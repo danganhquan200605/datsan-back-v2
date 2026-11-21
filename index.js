@@ -1,5 +1,9 @@
 require('dotenv').config();
 
+// STARTUP ENVIRONMENT GUARD (Enforces Staging-only in Local/Dev, blocks Production database)
+const { enforceStartupEnvironmentGuard } = require('./envGuard');
+enforceStartupEnvironmentGuard();
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -12,6 +16,11 @@ const {
   handleVerifyFailure,
   resetOtpLimits,
 } = require('./otpSecurity');
+const {
+  checkCourtDepositEligibility,
+  getOrCreateOwnerDeposit
+} = require('./depositAndCancellationService');
+const mountDepositAndCancellationRoutes = require('./routes/depositAndCancellationRoutes');
 
 const app = express();
 const port = Number(process.env.PORT || 5000);
@@ -213,6 +222,18 @@ app.post('/api/bookings', async (req, res) => {
       slots.some((id) => !Number.isInteger(Number(id)) || Number(id) <= 0)) {
     return res.status(400).json({ error: 'Invalid booking details' });
   }
+
+  // Feature 01: Kiểm tra nghĩa vụ ký quỹ bảo đảm 1.000.000đ của Chủ sân
+  if (adminSupabase) {
+    const { data: courtData } = await adminSupabase.from('san').select('machusan, tensan').eq('masan', masan).single();
+    if (courtData && courtData.machusan) {
+      const depCheck = await checkCourtDepositEligibility(courtData.machusan, adminSupabase);
+      if (!depCheck.allowed) {
+        return res.status(400).json({ error: `Cụm sân chưa đủ điều kiện nhận lịch đặt: ${depCheck.reason || 'Chưa hoàn tất ký quỹ bảo đảm 1.000.000đ'}` });
+      }
+    }
+  }
+
   const { data, error } = await userClient.rpc('create_booking', {
     p_masan: masan,
     p_ngaysudung: date,
@@ -1151,6 +1172,14 @@ app.post('/api/admin/fields/:id/status', async (req, res) => {
     const { data: field, error: fieldErr } = await adminSupabase.from('san').select('*').eq('masan', maSan).single();
     if (fieldErr || !field) return res.status(404).json({ error: 'Không tìm thấy cụm sân' });
 
+    // Feature 01: Kiểm tra điều kiện nộp ký quỹ bảo đảm 1.000.000đ trước khi duyệt HOATDONG
+    if (newStatus === 'HOATDONG' && field.machusan) {
+      const depCheck = await checkCourtDepositEligibility(field.machusan, adminSupabase);
+      if (!depCheck.allowed) {
+        return res.status(400).json({ error: `Không thể duyệt sân hoạt động: Chủ sân chưa nộp ký quỹ bảo đảm 1.000.000đ (${depCheck.reason || ''})` });
+      }
+    }
+
     const { error: updateErr } = await adminSupabase.from('san').update({ trangthai: newStatus }).eq('masan', maSan);
     if (updateErr) throw updateErr;
 
@@ -1337,6 +1366,9 @@ app.post('/api/storage/:bucket', upload.single('file'), async (req, res) => {
   const { data: publicUrl } = requestClient.storage.from(req.params.bucket).getPublicUrl(data.path);
   return res.json({ data, publicUrl: publicUrl.publicUrl });
 });
+
+// GẮN CÁC ENDPOINT CHO FEATURE 01 (OWNER DEPOSIT) VÀ FEATURE 02 (CUSTOMER CANCELLATION)
+mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticatedProfile });
 
 app.use((error, _req, res, _next) => res.status(400).json({ error: error.message || 'Request failed' }));
 app.listen(port, () => console.log(`DatSan API listening on port ${port}`));
