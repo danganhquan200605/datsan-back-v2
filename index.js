@@ -4,6 +4,14 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
+const {
+  checkOtpRateLimit,
+  checkOtpVerifyLock,
+  checkOtpExpiration,
+  handleVerifySuccess,
+  handleVerifyFailure,
+  resetOtpLimits,
+} = require('./otpSecurity');
 
 const app = express();
 const port = Number(process.env.PORT || 5000);
@@ -35,12 +43,23 @@ app.post('/api/auth/otp', async (req, res) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const phone = String(req.body?.phone || '').trim();
   if (!/^\+[1-9]\d{7,14}$/.test(phone)) return res.status(400).json({ error: 'Phone must use international format, for example +84912345678' });
+  
+  // Kiểm tra Rate Limiting & Cooldown & Khóa xác minh
+  const rateLimitCheck = checkOtpRateLimit(req, phone);
+  if (!rateLimitCheck.allowed) {
+    return res.status(rateLimitCheck.status).json({
+      error: rateLimitCheck.error,
+      retryAfter: rateLimitCheck.retryAfter,
+      lockRemaining: rateLimitCheck.lockRemaining,
+    });
+  }
+
   try {
     const { error } = await supabase.auth.signInWithOtp({ phone, options: { shouldCreateUser: true } });
     // Nếu gặp lỗi gửi SMS qua Twilio hoặc giới hạn nhà mạng, vẫn trả về thành công để cho phép dùng OTP 123456
-    return res.json({ sent: true });
+    return res.json({ sent: true, expiresIn: rateLimitCheck.expiresIn, cooldown: rateLimitCheck.cooldown });
   } catch (error) {
-    return res.json({ sent: true });
+    return res.json({ sent: true, expiresIn: rateLimitCheck.expiresIn, cooldown: rateLimitCheck.cooldown });
   }
 });
 
@@ -51,6 +70,22 @@ app.post('/api/auth/verify', async (req, res) => {
   if (!/^\+[1-9]\d{7,14}$/.test(phone) || !/^\d{4,10}$/.test(token)) {
     return res.status(400).json({ error: 'A valid phone and verification code are required' });
   }
+
+  // 1. Kiểm tra tài khoản có đang bị khóa do nhập sai OTP quá 5 lần
+  const lockCheck = checkOtpVerifyLock(phone);
+  if (lockCheck.locked) {
+    return res.status(lockCheck.status).json({
+      error: lockCheck.error,
+      lockRemaining: lockCheck.lockRemaining,
+    });
+  }
+
+  // 2. Kiểm tra thời hạn hiệu lực của OTP (5 phút)
+  const expireCheck = checkOtpExpiration(phone);
+  if (expireCheck.expired) {
+    return res.status(expireCheck.status).json({ error: expireCheck.error });
+  }
+
   try {
     let session = null;
 
@@ -83,14 +118,28 @@ app.post('/api/auth/verify', async (req, res) => {
         password: fixedPassword,
       });
       if (signError || !signData?.session) {
-        return res.status(401).json({ error: signError?.message || 'Mã xác thực không hợp lệ' });
+        const failResult = handleVerifyFailure(phone, signError?.message);
+        return res.status(failResult.status).json({
+          error: failResult.error,
+          remainingAttempts: failResult.remainingAttempts,
+          lockRemaining: failResult.lockRemaining,
+        });
       }
       session = signData.session;
     } else {
-      return res.status(401).json({ error: otpError?.message || 'Mã xác thực không hợp lệ' });
+      const failResult = handleVerifyFailure(phone, otpError?.message);
+      return res.status(failResult.status).json({
+        error: failResult.error,
+        remainingAttempts: failResult.remainingAttempts,
+        lockRemaining: failResult.lockRemaining,
+      });
     }
 
     if (!session?.access_token) return res.status(401).json({ error: 'Supabase did not return an authenticated session' });
+
+    // Xác thực thành công: Hủy trạng thái lỗi & vé OTP
+    handleVerifySuccess(phone);
+
     const userClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
       global: { headers: { Authorization: `Bearer ${session.access_token}` } },
       auth: { persistSession: false, autoRefreshToken: false },
@@ -104,9 +153,23 @@ app.post('/api/auth/verify', async (req, res) => {
       user: profile,
     });
   } catch (error) {
-    return res.status(401).json({ error: error.message || 'Could not verify the code' });
+    const failResult = handleVerifyFailure(phone, error.message);
+    return res.status(failResult.status).json({
+      error: failResult.error,
+      remainingAttempts: failResult.remainingAttempts,
+      lockRemaining: failResult.lockRemaining,
+    });
   }
 });
+
+if (process.env.NODE_ENV !== 'production') {
+  app.post('/api/auth/otp/reset-limit', (req, res) => {
+    const phone = req.body?.phone;
+    const ip = req.body?.ip;
+    resetOtpLimits(phone, ip);
+    return res.json({ ok: true });
+  });
+}
 
 app.post('/api/auth/refresh', async (req, res) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
@@ -230,72 +293,152 @@ app.post('/api/bookings', async (req, res) => {
   return res.json({ data });
 });
 
-app.post('/api/owner/settle-booking', async (req, res) => {
+app.get('/api/owner/overview', async (req, res) => {
   if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
-  const userClient = await getAuthenticatedClient(req);
-  if (!userClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
-  
-  const { action, bookingId, ownerId } = req.body || {};
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+  if (authData.role !== 'CHUSAN' && authData.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Field Owner or Admin privileges required' });
+  }
+
+  const ownerId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+  if (!ownerId || isNaN(ownerId)) {
+    return res.status(400).json({ error: 'Không tìm thấy thông tin chủ sân hợp lệ' });
+  }
 
   try {
-    if (action === 'CONFIRM_CASH') {
-      // 1. Chủ sân xác nhận đã thu 100% tiền mặt & hoàn thành trận đấu
-      const { data: booking, error: getErr } = await adminSupabase.from('datsan').select('*').eq('madatsan', bookingId).single();
-      if (getErr || !booking) return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+    // 1. Danh sách sân thuộc sở hữu của chủ sân này
+    const { data: mySanData, error: sanErr } = await adminSupabase
+      .from('san')
+      .select(`
+        masan,
+        tensan,
+        giasan,
+        hinhanh,
+        trangthai,
+        vitri (diachi, quan)
+      `)
+      .eq('machusan', ownerId);
 
-      let meta = {};
-      try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
-      meta.paymentMethod = 'TIEN_MAT';
-      meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
-      meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
-      meta.completedAt = new Date().toISOString();
+    if (sanErr) throw sanErr;
+    const sanIds = (mySanData || []).map(s => s.masan);
 
-      const { data, error } = await adminSupabase.from('datsan').update({
-        trangthai: 'HOAN_THANH',
-        ghichu: JSON.stringify(meta)
-      }).eq('madatsan', bookingId).select().single();
+    let bookingsData = [];
+    if (sanIds.length > 0) {
+      const { data: bData, error: bookingErr } = await adminSupabase
+        .from('datsan')
+        .select(`
+          madatsan,
+          ngaydat,
+          ngaysudung,
+          tongtien,
+          trangthai,
+          ghichu,
+          san (tensan),
+          nguoidung:makhachhang (hoten, sodienthoai),
+          datsan_khunggio (
+            khunggio (giobatdau, gioketthuc)
+          )
+        `)
+        .in('masan', sanIds)
+        .order('ngaydat', { ascending: false });
 
-      if (error) throw error;
-
-      // Thông báo cho khách hàng
-      try {
-        if (booking.makhachhang) {
-          await adminSupabase.from('thongbao').insert({
-            manguoidung: booking.makhachhang,
-            tieude: '✅ Trận đấu hoàn thành',
-            noidung: 'Chủ sân đã xác nhận thu tiền mặt và hoàn thành trận đấu. Cảm ơn bạn đã thi đấu!',
-            loaithongbao: 'MATCH_COMPLETED'
-          });
-        }
-      } catch {}
-
-      return res.json({ success: true, data });
+      if (bookingErr) throw bookingErr;
+      bookingsData = bData || [];
     }
 
-    if (action === 'CANCEL_NO_SHOW') {
-      // 2. Chủ sân báo khách bùng / hủy trận đấu tiền mặt
-      const { data: booking, error: getErr } = await adminSupabase.from('datsan').select('*').eq('madatsan', bookingId).single();
+    return res.json({
+      success: true,
+      data: {
+        fields: mySanData || [],
+        bookings: bookingsData
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Lỗi tải dữ liệu chủ sân' });
+  }
+});
+
+app.post('/api/owner/settle-booking', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+  if (authData.role !== 'CHUSAN' && authData.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Field Owner or Admin privileges required' });
+  }
+
+  const callerUserId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+  const { action, bookingId } = req.body || {};
+
+  try {
+    if (action === 'CONFIRM_CASH' || action === 'CANCEL_NO_SHOW') {
+      if (!bookingId) return res.status(400).json({ error: 'Thiếu mã đơn đặt sân' });
+
+      // Kiểm tra đơn đặt sân và quyền sở hữu tài nguyên (Resource Ownership)
+      const { data: booking, error: getErr } = await adminSupabase
+        .from('datsan')
+        .select('*, san(machusan)')
+        .eq('madatsan', bookingId)
+        .single();
+
       if (getErr || !booking) return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+
+      const pitchOwnerId = Number(booking.san?.machusan);
+      if (authData.role !== 'ADMIN' && pitchOwnerId !== callerUserId) {
+        return res.status(403).json({ error: 'Forbidden: You do not own the pitch for this booking' });
+      }
 
       let meta = {};
       try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
-      meta.paymentMethod = 'TIEN_MAT';
-      meta.commissionStatus = 'DA_HUY'; // Xóa sổ nợ hoa hồng
-      meta.commissionAmount = 0;
-      meta.cancelledAt = new Date().toISOString();
 
-      const { data, error } = await adminSupabase.from('datsan').update({
-        trangthai: 'DA_HUY',
-        ghichu: JSON.stringify(meta)
-      }).eq('madatsan', bookingId).select().single();
+      if (action === 'CONFIRM_CASH') {
+        meta.paymentMethod = 'TIEN_MAT';
+        meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
+        meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
+        meta.completedAt = new Date().toISOString();
 
-      if (error) throw error;
-      return res.json({ success: true, data });
+        const { data, error } = await adminSupabase.from('datsan').update({
+          trangthai: 'HOAN_THANH',
+          ghichu: JSON.stringify(meta)
+        }).eq('madatsan', bookingId).select().single();
+
+        if (error) throw error;
+
+        // Thông báo cho khách hàng
+        try {
+          if (booking.makhachhang) {
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: booking.makhachhang,
+              tieude: '✅ Trận đấu hoàn thành',
+              noidung: 'Chủ sân đã xác nhận thu tiền mặt và hoàn thành trận đấu. Cảm ơn bạn đã thi đấu!',
+              loaithongbao: 'MATCH_COMPLETED'
+            });
+          }
+        } catch {}
+
+        return res.json({ success: true, data });
+      }
+
+      if (action === 'CANCEL_NO_SHOW') {
+        meta.paymentMethod = 'TIEN_MAT';
+        meta.commissionStatus = 'DA_HUY'; // Xóa sổ nợ hoa hồng
+        meta.commissionAmount = 0;
+        meta.cancelledAt = new Date().toISOString();
+
+        const { data, error } = await adminSupabase.from('datsan').update({
+          trangthai: 'DA_HUY',
+          ghichu: JSON.stringify(meta)
+        }).eq('madatsan', bookingId).select().single();
+
+        if (error) throw error;
+        return res.json({ success: true, data });
+      }
     }
 
     if (action === 'SETTLE_ALL_COMMISSIONS') {
       // 3. Chủ sân quét QR nộp toàn bộ công nợ hoa hồng tích lũy cho Admin
-      const targetOwnerId = Number(ownerId);
+      // Không tin ownerId do client gửi: luôn dùng callerUserId trừ khi ADMIN gửi
+      const targetOwnerId = authData.role === 'ADMIN' && req.body?.ownerId ? Number(req.body.ownerId) : callerUserId;
       if (!targetOwnerId) return res.status(400).json({ error: 'Thiếu mã chủ sân' });
 
       const { data: sans } = await adminSupabase.from('san').select('masan').eq('machusan', targetOwnerId);
@@ -819,6 +962,180 @@ async function getAuthenticatedClient(req) {
   });
 }
 
+async function getAuthenticatedProfile(req) {
+  const authClient = await getAuthenticatedClient(req);
+  if (!authClient) return null;
+  try {
+    const { data: profile, error } = await authClient.rpc('ensure_current_nguoidung');
+    if (error || !profile) return null;
+    return { 
+      authClient, 
+      profile, 
+      role: String(profile?.vaitro || profile?.VaiTro || '').toUpperCase() 
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ==========================================
+// CÁC ENDPOINT QUẢN TRỊ TỐI CAO (SUPER ADMIN)
+// ==========================================
+
+// 1. ENDPOINT: LẤY TOÀN BỘ DỮ LIỆU TỔNG QUAN SUPER ADMIN (BẢO VỆ CHẶT CHẼ)
+app.get('/api/admin/overview', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+  if (authData.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Super Admin privileges required' });
+  }
+
+  try {
+    const [sanRes, vtRes, userRes, bookingRes] = await Promise.all([
+      adminSupabase.from('san').select('*').order('masan', { ascending: false }),
+      adminSupabase.from('vitri').select('*'),
+      adminSupabase.from('nguoidung').select('*').order('manguoidung', { ascending: false }),
+      adminSupabase.from('datsan').select('*').order('ngaydat', { ascending: false }),
+    ]);
+
+    const rawSan = sanRes.data || [];
+    const rawVt = vtRes.data || [];
+    const rawUsers = userRes.data || [];
+    const rawBookings = bookingRes.data || [];
+
+    const users = rawUsers.map(u => ({
+      manguoidung: u.manguoidung ?? u.id,
+      mataikhoan: u.manguoidung ?? u.id,
+      tendangnhap: u.tendangnhap || u.sodienthoai || '',
+      email: u.email || '',
+      sodienthoai: u.sodienthoai || '',
+      hoten: u.hoten || 'Người dùng',
+      vaitro: (u.vaitro || 'KHACHHANG').toUpperCase(),
+      trangthai: u.trangthai || 'HOATDONG',
+    }));
+
+    const fields = rawSan.map(s => {
+      const vt = rawVt.find(v => Number(v.mavitri ?? v.MaViTri) === Number(s.mavitri ?? s.MaViTri)) || {};
+      const owner = users.find(u => Number(u.manguoidung) === Number(s.machusan ?? s.MaChuSan)) || {};
+      return {
+        masan: s.masan ?? s.MaSan,
+        tensan: s.tensan ?? s.TenSan ?? 'Sân thể thao',
+        giasan: s.giasan ?? s.GiaSan ?? 300000,
+        hinhanh: s.hinhanh ?? s.HinhAnh ?? 'https://images.unsplash.com/photo-1529900248057-5e632c63c574?auto=format&fit=crop&w=800&q=80',
+        trangthai: s.trangthai ?? s.TrangThai ?? 'HOATDONG',
+        mota: s.mota ?? s.MoTa ?? '',
+        machusan: s.machusan ?? s.MaChuSan,
+        vitri: {
+          diachi: vt.diachi || vt.DiaChi || 'Chưa cập nhật địa chỉ',
+          quan: vt.quan || vt.Quan || 'Đà Nẵng',
+        },
+        nguoidung: {
+          hoten: owner.hoten || 'Chủ sân',
+          sodienthoai: owner.sodienthoai || '',
+          email: owner.email || '',
+        },
+      };
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        fields,
+        users,
+        bookings: rawBookings,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Lỗi lấy dữ liệu tổng quan admin' });
+  }
+});
+
+// 2. ENDPOINT: DUYỆT / TỪ CHỐI / KHÓA SÂN BÃI (ATOMIC & AUDIT LOGGED)
+app.post('/api/admin/fields/:id/status', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+  if (authData.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Super Admin privileges required' });
+  }
+
+  const maSan = Number(req.params.id);
+  const { status: newStatus, reason } = req.body || {};
+  if (!maSan || !['HOATDONG', 'TU_CHOI', 'TAM_DUNG', 'KHOA'].includes(newStatus)) {
+    return res.status(400).json({ error: 'Trạng thái cập nhật không hợp lệ' });
+  }
+
+  try {
+    const { data: field, error: fieldErr } = await adminSupabase.from('san').select('*').eq('masan', maSan).single();
+    if (fieldErr || !field) return res.status(404).json({ error: 'Không tìm thấy cụm sân' });
+
+    const { error: updateErr } = await adminSupabase.from('san').update({ trangthai: newStatus }).eq('masan', maSan);
+    if (updateErr) throw updateErr;
+
+    // Duyệt sân thành công: nâng quyền Chủ sân nếu cần & gửi thông báo
+    if (newStatus === 'HOATDONG' && field.machusan) {
+      await adminSupabase.from('nguoidung').update({ vaitro: 'CHUSAN' }).eq('manguoidung', field.machusan);
+      await adminSupabase.from('thongbao').insert({
+        manguoidung: field.machusan,
+        tieude: '🎉 Hồ sơ cụm sân đã được phê duyệt!',
+        noidung: `Chúc mừng bạn! Cụm sân "${field.tensan}" đã được Super Admin phê duyệt và chính thức mở nhận đặt lịch trên DatSanOnline.`,
+        loaithongbao: 'SYSTEM',
+        dread: false,
+      });
+    }
+
+    // Từ chối hồ sơ sân: ghi nhận lý do & gửi thông báo cho chủ sân
+    if (newStatus === 'TU_CHOI' && field.machusan) {
+      const rejectReason = reason && reason.trim() ? reason.trim() : 'Hồ sơ chưa đạt tiêu chuẩn kiểm duyệt của sàn.';
+      await adminSupabase.from('thongbao').insert({
+        manguoidung: field.machusan,
+        tieude: '⚠️ Hồ sơ đăng ký sân chưa được duyệt',
+        noidung: `Rất tiếc, hồ sơ cụm sân "${field.tensan}" chưa được phê duyệt. Lý do: ${rejectReason}. Vui lòng liên hệ ban quản trị để được hỗ trợ.`,
+        loaithongbao: 'SYSTEM',
+        dread: false,
+      });
+    }
+
+    return res.json({ success: true, message: `Đã cập nhật trạng thái sân thành ${newStatus}` });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Lỗi cập nhật trạng thái sân' });
+  }
+});
+
+// 3. ENDPOINT: THAY ĐỔI VAI TRÒ NGƯỜI DÙNG (SUPER ADMIN CHỈ ĐỊNH)
+app.post('/api/admin/users/:id/role', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+  if (authData.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Super Admin privileges required' });
+  }
+
+  const userId = Number(req.params.id);
+  const { role: targetRole } = req.body || {};
+  if (!userId || !['KHACHHANG', 'CHUSAN', 'ADMIN'].includes(targetRole)) {
+    return res.status(400).json({ error: 'Vai trò người dùng không hợp lệ' });
+  }
+
+  try {
+    const { error } = await adminSupabase.from('nguoidung').update({ vaitro: targetRole }).eq('manguoidung', userId);
+    if (error) throw error;
+
+    await adminSupabase.from('thongbao').insert({
+      manguoidung: userId,
+      tieude: '👑 Thông báo thay đổi phân quyền tài khoản',
+      noidung: `Tài khoản của bạn đã được Super Admin chuyển sang vai trò: ${targetRole}.`,
+      loaithongbao: 'SYSTEM',
+      dread: false,
+    });
+
+    return res.json({ success: true, message: `Đã cập nhật vai trò người dùng thành ${targetRole}` });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Lỗi đổi vai trò người dùng' });
+  }
+});
+
 app.post('/api/data', async (req, res) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const { table, action = 'select', columns = '*', filters = [], values } = req.body || {};
@@ -833,7 +1150,6 @@ app.post('/api/data', async (req, res) => {
     if (requiresAuth) return res.status(401).json({ error: 'Valid Supabase access token required' });
     requestClient = supabase;
   } else if (adminSupabase) {
-    // Nếu tài khoản là ADMIN, dùng adminSupabase để xem toàn bộ hồ sơ sân chờ duyệt (bỏ qua RLS anon)
     try {
       const { data: profile } = await authClient.rpc('ensure_current_nguoidung');
       const role = String(profile?.vaitro || profile?.VaiTro || '').toUpperCase();
@@ -842,6 +1158,50 @@ app.post('/api/data', async (req, res) => {
       }
     } catch {
       // Giữ nguyên authClient nếu không check được profile
+    }
+  }
+
+  // =========================================================================
+  // P0 - KIỂM SOÁT PHÂN QUYỀN CHẶT CHẼ TRÊN TỪNG BẢNG (SERVER-SIDE AUTHORIZATION)
+  // =========================================================================
+
+  // 1. Bảng nguoidung
+  if (table === 'nguoidung') {
+    if (!authClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    const authData = await getAuthenticatedProfile(req);
+    const userRole = authData?.role;
+    const currentUserId = authData?.profile?.manguoidung ?? authData?.profile?.MaNguoiDung;
+
+    // Xem danh sách toàn bộ người dùng bắt buộc quyền ADMIN
+    const isSelfQuery = filters.some(f => (f.column === 'manguoidung' || f.column === 'id') && Number(f.value) === Number(currentUserId));
+    if (action === 'select' && !isSelfQuery && userRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: Super Admin access required to view all users' });
+    }
+
+    // Đổi vai trò (vaitro) người dùng bắt buộc quyền ADMIN
+    if (action === 'update' && values && ('vaitro' in values || 'VaiTro' in values) && userRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: Super Admin access required to change user roles' });
+    }
+  }
+
+  // 2. Bảng san
+  if (table === 'san' && action === 'update') {
+    if (!authClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    const authData = await getAuthenticatedProfile(req);
+    const userRole = authData?.role;
+    if (values && ('trangthai' in values || 'TrangThai' in values) && userRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: Super Admin access required to update field approval status' });
+    }
+  }
+
+  // 3. Bảng datsan
+  if (table === 'datsan' && action === 'select' && requiresAuth) {
+    if (!authClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    const authData = await getAuthenticatedProfile(req);
+    const userRole = authData?.role;
+    const isSelfOrPitchFiltered = filters.some(f => ['makhachhang', 'masan'].includes(f.column));
+    if (!isSelfOrPitchFiltered && userRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: Super Admin access required to view global bookings' });
     }
   }
   if (action === 'insert' && ['datsan', 'datsan_khunggio'].includes(table)) {
