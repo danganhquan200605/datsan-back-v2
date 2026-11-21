@@ -258,54 +258,105 @@ assert(foreignRes.ok === false, 'Blocked foreign unapproved Supabase ref');
 assert(foreignRes.code === 'ERR_INVALID_STAGING_REF', 'Foreign ref code is ERR_INVALID_STAGING_REF');
 
 // --------------------------------------------------------------------------
-// 7. UNIT TESTS: PRODUCTION RENDER ENVIRONMENT (REQUIREMENT 6)
+// 7. UNIT TESTS: PRODUCTION RENDER ENVIRONMENT (STRICT GUARD)
 // --------------------------------------------------------------------------
-console.log('\n--- 7. PRODUCTION RENDER ENVIRONMENT (AUTHORIZATION) ---');
+console.log('\n--- 7. PRODUCTION RENDER ENVIRONMENT (STRICT GUARD) ---');
 
-const prodRenderEnv = {
+const prodRenderBaseEnv = {
   FINANCIAL_MODE: 'DEMO',
   RENDER: 'true',
   SUPABASE_URL: `https://${PRODUCTION_PROJECT_REF}.supabase.co`,
+  DATABASE_URL: `postgresql://postgres.${PRODUCTION_PROJECT_REF}:secret@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres`,
   SUPABASE_ANON_KEY: prodAnonKey
 };
 
-assert(isProductionRender(prodRenderEnv) === true, 'Detected Render production platform');
-const prodRenderRes = validateEnvironmentConfig(prodRenderEnv);
-assert(prodRenderRes.ok === true, 'Production Render allowed to connect to Production database');
+// 7a. Detected platform and authorized with valid Prod config
+assert(isProductionRender(prodRenderBaseEnv) === true, 'Detected Render production platform');
+const prodRenderRes = validateEnvironmentConfig(prodRenderBaseEnv);
+assert(prodRenderRes.ok === true, 'Production Render allowed with valid Production SUPABASE_URL and DATABASE_URL');
 assert(prodRenderRes.mode === 'PRODUCTION_RENDER', 'Mode is PRODUCTION_RENDER');
 assert(prodRenderRes.isProduction === true, 'isProduction flag is true');
 
-// 7b. Production Render safety: verify SUPABASE_URL & DATABASE_URL point to Production Project Ref
-const prodRenderWithDbEnv = {
-  ...prodRenderEnv,
-  DATABASE_URL: `postgresql://postgres.${PRODUCTION_PROJECT_REF}:secret@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres`
+// 7b. Missing SUPABASE_URL on Render
+const prodRenderMissingUrlEnv = {
+  ...prodRenderBaseEnv,
+  SUPABASE_URL: ''
 };
-const prodRenderWithDbRes = validateEnvironmentConfig(prodRenderWithDbEnv);
-assert(prodRenderWithDbRes.ok === true, 'Production Render with valid Production DATABASE_URL authorized');
+const prodRenderMissingUrlRes = validateEnvironmentConfig(prodRenderMissingUrlEnv);
+assert(prodRenderMissingUrlRes.ok === false, 'Production Render rejected when SUPABASE_URL is missing');
+assert(prodRenderMissingUrlRes.code === 'ERR_PRODUCTION_MISSING_SUPABASE_URL', 'Code is ERR_PRODUCTION_MISSING_SUPABASE_URL');
 
-// 7c. Production Render rejected if SUPABASE_URL points to Staging
+// 7c. Missing DATABASE_URL on Render
+const prodRenderMissingDbEnv = {
+  ...prodRenderBaseEnv,
+  DATABASE_URL: ''
+};
+const prodRenderMissingDbRes = validateEnvironmentConfig(prodRenderMissingDbEnv);
+assert(prodRenderMissingDbRes.ok === false, 'Production Render rejected when DATABASE_URL is missing');
+assert(prodRenderMissingDbRes.code === 'ERR_PRODUCTION_MISSING_DATABASE_URL', 'Code is ERR_PRODUCTION_MISSING_DATABASE_URL');
+
+// 7d. Invalid / unextractable SUPABASE_URL on Render
+const prodRenderInvalidUrlEnv = {
+  ...prodRenderBaseEnv,
+  SUPABASE_URL: 'https://non-supabase-endpoint.org'
+};
+const prodRenderInvalidUrlRes = validateEnvironmentConfig(prodRenderInvalidUrlEnv);
+assert(prodRenderInvalidUrlRes.ok === false, 'Production Render rejected when SUPABASE_URL is unextractable');
+assert(prodRenderInvalidUrlRes.code === 'ERR_PRODUCTION_SUPABASE_URL_INVALID', 'Code is ERR_PRODUCTION_SUPABASE_URL_INVALID');
+
+// 7e. Invalid / unextractable DATABASE_URL on Render
+const prodRenderInvalidDbEnv = {
+  ...prodRenderBaseEnv,
+  DATABASE_URL: 'mysql://root:pass@127.0.0.1:3306/db'
+};
+const prodRenderInvalidDbRes = validateEnvironmentConfig(prodRenderInvalidDbEnv);
+assert(prodRenderInvalidDbRes.ok === false, 'Production Render rejected when DATABASE_URL is unextractable');
+assert(prodRenderInvalidDbRes.code === 'ERR_PRODUCTION_DATABASE_URL_INVALID', 'Code is ERR_PRODUCTION_DATABASE_URL_INVALID');
+
+// 7f. Foreign unapproved SUPABASE_URL on Render
+const prodRenderForeignUrlEnv = {
+  ...prodRenderBaseEnv,
+  SUPABASE_URL: 'https://someforeignproj12345.supabase.co'
+};
+const prodRenderForeignUrlRes = validateEnvironmentConfig(prodRenderForeignUrlEnv);
+assert(prodRenderForeignUrlRes.ok === false, 'Production Render rejected when SUPABASE_URL has foreign project ref');
+assert(prodRenderForeignUrlRes.code === 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH', 'Code is ERR_PRODUCTION_SUPABASE_URL_MISMATCH');
+
+// 7g. Foreign unapproved DATABASE_URL on Render
+const prodRenderForeignDbEnv = {
+  ...prodRenderBaseEnv,
+  DATABASE_URL: 'postgresql://postgres.foreignproj12345:pass@pooler.supabase.com:6543/postgres'
+};
+const prodRenderForeignDbRes = validateEnvironmentConfig(prodRenderForeignDbEnv);
+assert(prodRenderForeignDbRes.ok === false, 'Production Render rejected when DATABASE_URL has foreign project ref');
+assert(prodRenderForeignDbRes.code === 'ERR_PRODUCTION_DATABASE_URL_MISMATCH', 'Code is ERR_PRODUCTION_DATABASE_URL_MISMATCH');
+
+// 7h. Production Render rejected if SUPABASE_URL points to Staging
 const prodRenderStagingUrlEnv = {
-  ...prodRenderEnv,
+  ...prodRenderBaseEnv,
   SUPABASE_URL: `https://${STAGING_PROJECT_REF}.supabase.co`
 };
 const prodRenderStagingUrlRes = validateEnvironmentConfig(prodRenderStagingUrlEnv);
 assert(prodRenderStagingUrlRes.ok === false, 'Production Render rejected when SUPABASE_URL points to Staging');
-assert(
-  prodRenderStagingUrlRes.code === 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH' || prodRenderStagingUrlRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING',
-  'Code indicates Staging mismatch on Production Render'
-);
+assert(prodRenderStagingUrlRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING', 'Code is ERR_PRODUCTION_POINTING_TO_STAGING');
 
-// 7d. Production Render rejected if DATABASE_URL points to Staging
+// 7i. Production Render rejected if DATABASE_URL points to Staging
 const prodRenderStagingDbEnv = {
-  ...prodRenderEnv,
+  ...prodRenderBaseEnv,
   DATABASE_URL: `postgresql://postgres.${STAGING_PROJECT_REF}:secret@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres`
 };
 const prodRenderStagingDbRes = validateEnvironmentConfig(prodRenderStagingDbEnv);
 assert(prodRenderStagingDbRes.ok === false, 'Production Render rejected when DATABASE_URL points to Staging');
-assert(
-  prodRenderStagingDbRes.code === 'ERR_PRODUCTION_DATABASE_URL_MISMATCH' || prodRenderStagingDbRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING',
-  'Code indicates DB Staging mismatch on Production Render'
-);
+assert(prodRenderStagingDbRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING', 'Code is ERR_PRODUCTION_POINTING_TO_STAGING');
+
+// 7j. Production Render rejected if JWT token belongs to Staging
+const prodRenderStagingJwtEnv = {
+  ...prodRenderBaseEnv,
+  SUPABASE_ANON_KEY: stagingAnonKey
+};
+const prodRenderStagingJwtRes = validateEnvironmentConfig(prodRenderStagingJwtEnv);
+assert(prodRenderStagingJwtRes.ok === false, 'Production Render rejected when JWT belongs to Staging');
+assert(prodRenderStagingJwtRes.code === 'ERR_PRODUCTION_POINTING_TO_STAGING', 'Code is ERR_PRODUCTION_POINTING_TO_STAGING');
 
 // --------------------------------------------------------------------------
 // 8. PROCESS INTEGRATION TESTS: REAL CHILD PROCESS EXECUTION

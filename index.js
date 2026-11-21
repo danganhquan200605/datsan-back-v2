@@ -248,10 +248,8 @@ app.post('/api/bookings', async (req, res) => {
     const bookingTotal = Number(data?.tongtien || data?.TongTien || 0);
     const commissionAmount = Math.round(bookingTotal * 0.1); // 10% hoa hồng sàn
     const isCash = paymentMethod === 'TIEN_MAT';
-    const isMockPayment = paymentMethod === 'QR' || paymentMethod === 'MOCK_GATEWAY';
-    const simulateInstant = req.body?.simulateInstant === true && req.body?.simulationAction === 'SIMULATE_SUCCESS';
-    const status = isCash ? 'CHO_THI_DAU' : (simulateInstant ? 'DA_THANH_TOAN' : 'CHO_THANH_TOAN');
-    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : (simulateInstant ? 'DA_THU_SAN' : 'CHO_THANH_TOAN');
+    const status = isCash ? 'CHO_THI_DAU' : 'CHO_THANH_TOAN';
+    const commissionStatus = isCash ? 'CHO_XAC_NHAN_TRAN' : 'CHO_THANH_TOAN';
 
     const meta = {
       paymentMethod,
@@ -259,16 +257,11 @@ app.post('/api/bookings', async (req, res) => {
       commissionAmount,
       commissionStatus,
       services: req.body?.services || {},
-      paidAmount: simulateInstant ? bookingTotal : 0,
-      remainingAmount: simulateInstant ? 0 : bookingTotal,
+      paidAmount: 0,
+      remainingAmount: bookingTotal,
       financialMode: 'DEMO',
-      isSimulatedPayment: simulateInstant
+      isSimulatedPayment: false
     };
-
-    if (simulateInstant) {
-      meta.mockBankTx = `MOCK_TX_${Date.now()}_${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-      meta.paymentSimulatedAt = new Date().toISOString();
-    }
 
     await adminSupabase.from('datsan').update({
       trangthai: status,
@@ -281,8 +274,8 @@ app.post('/api/bookings', async (req, res) => {
       data.phuongthuc = paymentMethod;
     }
 
-    // Gửi thông báo hệ thống tự động cho Khách hàng, Chủ sân và Admin khi đơn đã thanh toán hoặc tiền mặt
-    if (isCash || simulateInstant) {
+    // Gửi thông báo hệ thống tự động cho Khách hàng, Chủ sân và Admin khi đơn đặt sân tiền mặt tại sân
+    if (isCash) {
       try {
         const { data: sanData } = await adminSupabase.from('san').select('tensan, machusan').eq('masan', masan).single();
         const sanName = sanData?.tensan || 'Sân thể thao';

@@ -91,45 +91,107 @@ function validateEnvironmentConfig(env = process.env) {
 
   const isProd = isProductionRender(env);
 
-  // Requirement 6 & Production Safety: On Production Render, verify connections point to Production Project Ref
+  // Requirement: On Production Render, SUPABASE_URL and DATABASE_URL are strictly mandatory and must both point to PRODUCTION_PROJECT_REF
   if (isProd) {
     const prodSupabaseUrl = String(env.SUPABASE_URL || '').trim();
     const prodDatabaseUrl = String(env.DATABASE_URL || '').trim();
 
-    // Check SUPABASE_URL if provided
-    if (prodSupabaseUrl) {
-      const ref = extractProjectRefFromUrl(prodSupabaseUrl);
-      if (ref && ref !== PRODUCTION_PROJECT_REF) {
-        return {
-          ok: false,
-          code: 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH',
-          mode: 'PRODUCTION_RENDER',
-          error: `PRODUCTION_SUPABASE_URL_MISMATCH: Production Render SUPABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${ref}"! Startup aborted.`
-        };
-      }
+    // 1. Mandatory SUPABASE_URL
+    if (!prodSupabaseUrl) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_MISSING_SUPABASE_URL',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_MISSING_SUPABASE_URL: Production Render environment strictly requires SUPABASE_URL configured! Startup aborted.`
+      };
     }
 
-    // Check DATABASE_URL if provided
-    if (prodDatabaseUrl) {
-      const ref = extractProjectRefFromUrl(prodDatabaseUrl);
-      if (ref && ref !== PRODUCTION_PROJECT_REF) {
-        return {
-          ok: false,
-          code: 'ERR_PRODUCTION_DATABASE_URL_MISMATCH',
-          mode: 'PRODUCTION_RENDER',
-          error: `PRODUCTION_DATABASE_URL_MISMATCH: Production Render DATABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${ref}"! Startup aborted.`
-        };
-      }
+    // 2. Mandatory DATABASE_URL
+    if (!prodDatabaseUrl) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_MISSING_DATABASE_URL',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_MISSING_DATABASE_URL: Production Render environment strictly requires DATABASE_URL configured! Startup aborted.`
+      };
     }
 
-    // Never allow Staging Ref on Production Render
-    if (prodSupabaseUrl.includes(STAGING_PROJECT_REF) || prodDatabaseUrl.includes(STAGING_PROJECT_REF)) {
+    // 3. Extract and verify SUPABASE_URL Project Ref
+    const supabaseRef = extractProjectRefFromUrl(prodSupabaseUrl);
+    if (!supabaseRef) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_SUPABASE_URL_INVALID',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_SUPABASE_URL_INVALID: Unable to extract Supabase Project Ref from SUPABASE_URL ("${prodSupabaseUrl}")! Startup aborted.`
+      };
+    }
+    if (supabaseRef === STAGING_PROJECT_REF || prodSupabaseUrl.includes(STAGING_PROJECT_REF)) {
       return {
         ok: false,
         code: 'ERR_PRODUCTION_POINTING_TO_STAGING',
         mode: 'PRODUCTION_RENDER',
-        error: `PRODUCTION_POINTING_TO_STAGING: Production Render environment cannot point to Staging Project Ref (${STAGING_PROJECT_REF})! Startup aborted.`
+        error: `PRODUCTION_POINTING_TO_STAGING: Production Render SUPABASE_URL cannot point to Staging Project Ref (${STAGING_PROJECT_REF})! Startup aborted.`
       };
+    }
+    if (supabaseRef !== PRODUCTION_PROJECT_REF) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_SUPABASE_URL_MISMATCH',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_SUPABASE_URL_MISMATCH: Production Render SUPABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${supabaseRef}"! Startup aborted.`
+      };
+    }
+
+    // 4. Extract and verify DATABASE_URL Project Ref
+    const dbRef = extractProjectRefFromUrl(prodDatabaseUrl);
+    if (!dbRef) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_DATABASE_URL_INVALID',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_DATABASE_URL_INVALID: Unable to extract Supabase Project Ref from DATABASE_URL ("${prodDatabaseUrl}")! Startup aborted.`
+      };
+    }
+    if (dbRef === STAGING_PROJECT_REF || prodDatabaseUrl.includes(STAGING_PROJECT_REF)) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_POINTING_TO_STAGING',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_POINTING_TO_STAGING: Production Render DATABASE_URL cannot point to Staging Project Ref (${STAGING_PROJECT_REF})! Startup aborted.`
+      };
+    }
+    if (dbRef !== PRODUCTION_PROJECT_REF) {
+      return {
+        ok: false,
+        code: 'ERR_PRODUCTION_DATABASE_URL_MISMATCH',
+        mode: 'PRODUCTION_RENDER',
+        error: `PRODUCTION_DATABASE_URL_MISMATCH: Production Render DATABASE_URL must point to Production Project Ref (${PRODUCTION_PROJECT_REF}), but detected "${dbRef}"! Startup aborted.`
+      };
+    }
+
+    // 5. Check API keys JWT tokens if present
+    for (const keyVar of ['SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY']) {
+      const token = String(env[keyVar] || '').trim();
+      if (token) {
+        const jwtRef = extractRefFromJwt(token);
+        if (jwtRef === STAGING_PROJECT_REF) {
+          return {
+            ok: false,
+            code: 'ERR_PRODUCTION_POINTING_TO_STAGING',
+            mode: 'PRODUCTION_RENDER',
+            error: `PRODUCTION_POINTING_TO_STAGING: Production Render ${keyVar} contains Staging token (${STAGING_PROJECT_REF})! Startup aborted.`
+          };
+        }
+        if (jwtRef && jwtRef !== PRODUCTION_PROJECT_REF) {
+          return {
+            ok: false,
+            code: 'ERR_PRODUCTION_JWT_MISMATCH',
+            mode: 'PRODUCTION_RENDER',
+            error: `PRODUCTION_JWT_MISMATCH: Production Render ${keyVar} token does not match Production Project Ref (${PRODUCTION_PROJECT_REF})! Startup aborted.`
+          };
+        }
+      }
     }
 
     return {

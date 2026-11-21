@@ -2117,13 +2117,22 @@ async function processMockPayment({
         };
       }
 
-      // Check if cancelled
+      // Check if cancelled or not pending
       if (booking.trangthai === 'DA_HUY' || booking.trangthai === 'DAHUY') {
         await client.query('ROLLBACK');
         return {
           success: false,
           code: 'INVALID_STATUS',
           message: 'Đơn đặt sân đã bị hủy, không thể thực hiện mô phỏng thanh toán.'
+        };
+      }
+
+      if (booking.trangthai !== 'CHO_THANH_TOAN') {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          code: 'INVALID_STATUS',
+          message: `Đơn đặt sân đang ở trạng thái '${booking.trangthai}', chỉ có thể thực hiện thanh toán khi ở trạng thái 'CHO_THANH_TOAN'.`
         };
       }
 
@@ -2148,17 +2157,35 @@ async function processMockPayment({
         meta.paymentSimulatedAt = new Date().toISOString();
 
         if (sb) {
-          await sb.from('datsan').update({
+          const { data: updated, error: updErr } = await sb.from('datsan').update({
             trangthai: 'DA_THANH_TOAN',
             ghichu: JSON.stringify(meta)
-          }).eq('madatsan', transactionId);
+          }).eq('madatsan', transactionId).eq('trangthai', 'CHO_THANH_TOAN').select();
+
+          if (updErr || !updated || updated.length === 0) {
+            await client.query('ROLLBACK');
+            return {
+              success: false,
+              code: 'CONCURRENT_CONFLICT',
+              message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+            };
+          }
         } else {
-          await client.query(`
+          const updRes = await client.query(`
             UPDATE datsan
             SET trangthai = 'DA_THANH_TOAN',
                 ghichu = $1
-            WHERE madatsan = $2
+            WHERE madatsan = $2 AND trangthai = 'CHO_THANH_TOAN'
           `, [JSON.stringify(meta), transactionId]);
+
+          if (updRes.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return {
+              success: false,
+              code: 'CONCURRENT_CONFLICT',
+              message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+            };
+          }
         }
 
         await logFinancialAudit(client, {
@@ -2229,17 +2256,35 @@ async function processMockPayment({
           meta.lastSimulation = { action: 'FAILURE_SWITCHED_CASH', at: new Date().toISOString() };
 
           if (sb) {
-            await sb.from('datsan').update({
+            const { data: updated, error: updErr } = await sb.from('datsan').update({
               trangthai: 'CHO_THI_DAU',
               ghichu: JSON.stringify(meta)
-            }).eq('madatsan', transactionId);
+            }).eq('madatsan', transactionId).eq('trangthai', 'CHO_THANH_TOAN').select();
+
+            if (updErr || !updated || updated.length === 0) {
+              await client.query('ROLLBACK');
+              return {
+                success: false,
+                code: 'CONCURRENT_CONFLICT',
+                message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+              };
+            }
           } else {
-            await client.query(`
+            const updRes = await client.query(`
               UPDATE datsan
               SET trangthai = 'CHO_THI_DAU',
                   ghichu = $1
-              WHERE madatsan = $2
+              WHERE madatsan = $2 AND trangthai = 'CHO_THANH_TOAN'
             `, [JSON.stringify(meta), transactionId]);
+
+            if (updRes.rowCount === 0) {
+              await client.query('ROLLBACK');
+              return {
+                success: false,
+                code: 'CONCURRENT_CONFLICT',
+                message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+              };
+            }
           }
 
           await logFinancialAudit(client, {
@@ -2270,19 +2315,57 @@ async function processMockPayment({
           meta.commissionStatus = 'DA_HUY';
 
           if (sb) {
-            await sb.from('datsan').update({
+            const { data: updated, error: updErr } = await sb.from('datsan').update({
               trangthai: 'DA_HUY',
               ghichu: JSON.stringify(meta)
-            }).eq('madatsan', transactionId);
-            await sb.from('chitietdatsan').delete().eq('madatsan', transactionId);
+            }).eq('madatsan', transactionId).eq('trangthai', 'CHO_THANH_TOAN').select();
+
+            if (updErr || !updated || updated.length === 0) {
+              await client.query('ROLLBACK');
+              return {
+                success: false,
+                code: 'CONCURRENT_CONFLICT',
+                message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+              };
+            }
+
+            // Giải phóng các khung giờ trong bảng chính thức datsan_khunggio
+            const { error: delErr } = await sb.from('datsan_khunggio').delete().eq('madatsan', transactionId);
+            if (delErr) {
+              // Hoàn tác trạng thái datsan để bảo đảm không xảy ra hủy một phần
+              await sb.from('datsan').update({
+                trangthai: booking.trangthai,
+                ghichu: booking.ghichu
+              }).eq('madatsan', transactionId);
+              await client.query('ROLLBACK');
+              return {
+                success: false,
+                code: 'RELEASE_SLOTS_FAILED',
+                message: 'Không thể giải phóng khung giờ đặt sân. Đã hoàn tác trạng thái để bảo đảm tính nhất quán dữ liệu.'
+              };
+            }
+
+            // Đồng bộ trạng thái thanhtoan nếu có
+            await sb.from('thanhtoan').update({ trangthai: 'DA_HUY' }).eq('madatsan', transactionId);
           } else {
-            await client.query(`
+            const updRes = await client.query(`
               UPDATE datsan
               SET trangthai = 'DA_HUY',
                   ghichu = $1
-              WHERE madatsan = $2
+              WHERE madatsan = $2 AND trangthai = 'CHO_THANH_TOAN'
             `, [JSON.stringify(meta), transactionId]);
-            await client.query(`DELETE FROM chitietdatsan WHERE madatsan = $1`, [transactionId]);
+
+            if (updRes.rowCount === 0) {
+              await client.query('ROLLBACK');
+              return {
+                success: false,
+                code: 'CONCURRENT_CONFLICT',
+                message: 'Đơn đặt sân đã được xử lý hoặc thay đổi trạng thái bởi một yêu cầu khác.'
+              };
+            }
+
+            await client.query(`DELETE FROM datsan_khunggio WHERE madatsan = $1`, [transactionId]);
+            await client.query(`UPDATE thanhtoan SET trangthai = 'DA_HUY' WHERE madatsan = $1`, [transactionId]);
           }
 
           await logFinancialAudit(client, {
