@@ -223,6 +223,57 @@ app.post('/api/bookings', async (req, res) => {
     return res.status(400).json({ error: 'Invalid booking details' });
   }
 
+  // TASK 01 (P0): Chặn đặt sân trong quá khứ trên server (Asia/Ho_Chi_Minh, UTC+7)
+  const nowVnDate = new Date();
+  const vnDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).format(nowVnDate); // YYYY-MM-DD
+  const vnTimeStr = new Intl.DateTimeFormat('en-GB', { 
+    timeZone: 'Asia/Ho_Chi_Minh', 
+    hour: '2-digit', 
+    minute: '2-digit', 
+    second: '2-digit', 
+    hour12: false 
+  }).format(nowVnDate); // HH:mm:ss
+
+  // 1. Chặn ngày quá khứ
+  if (date < vnDateStr) {
+    return res.status(400).json({ 
+      error: 'Không thể đặt sân trong ngày quá khứ. Vui lòng chọn ngày hợp lệ.',
+      code: 'ERR_PAST_DATE'
+    });
+  }
+
+  // 2. Nếu đặt cho ngày hôm nay: kiểm tra từng khung giờ bắt đầu phải lớn hơn thời gian hiện tại
+  if (date === vnDateStr) {
+    const { data: slotRows, error: slotErr } = await (adminSupabase || supabase)
+      .from('khunggio')
+      .select('makhunggio, giobatdau, gioketthuc')
+      .eq('masan', masan)
+      .in('makhunggio', slots.map(Number));
+
+    if (slotErr || !slotRows || slotRows.length !== slots.length) {
+      return res.status(400).json({ 
+        error: 'Một hoặc nhiều khung giờ không tồn tại trên sân này.', 
+        code: 'ERR_INVALID_SLOTS' 
+      });
+    }
+
+    // Quy tắc: Khách hàng chỉ được đặt những khung giờ có thời gian bắt đầu lớn hơn thời gian hiện tại.
+    // Nếu giobatdau <= vnTimeStr thì không hợp lệ.
+    const pastSlot = slotRows.find(s => {
+      const start = String(s.giobatdau || '').slice(0, 8);
+      return start <= vnTimeStr;
+    });
+
+    if (pastSlot) {
+      const slotStart = String(pastSlot.giobatdau || '').slice(0, 5);
+      return res.status(400).json({
+        error: `Khung giờ ${slotStart} đã qua hoặc đang diễn ra (Giờ hiện tại: ${vnTimeStr.slice(0, 5)}). Chỉ được đặt khung giờ có thời gian bắt đầu trong tương lai.`,
+        code: 'ERR_PAST_SLOT',
+        invalidSlot: pastSlot.makhunggio
+      });
+    }
+  }
+
   // Feature 01: Kiểm tra nghĩa vụ ký quỹ bảo đảm 1.000.000đ của Chủ sân
   if (adminSupabase) {
     const { data: courtData } = await adminSupabase.from('san').select('machusan, tensan').eq('masan', masan).single();
@@ -411,13 +462,13 @@ app.post('/api/owner/settle-booking', async (req, res) => {
   const { action, bookingId } = req.body || {};
 
   try {
-    if (action === 'CONFIRM_CASH' || action === 'CANCEL_NO_SHOW') {
+    if (action === 'CONFIRM_CASH' || action === 'COMPLETE_MATCH' || action === 'CANCEL_NO_SHOW') {
       if (!bookingId) return res.status(400).json({ error: 'Thiếu mã đơn đặt sân' });
 
       // Kiểm tra đơn đặt sân và quyền sở hữu tài nguyên (Resource Ownership)
       const { data: booking, error: getErr } = await adminSupabase
         .from('datsan')
-        .select('*, san(machusan)')
+        .select('*, san(machusan), datsan_khunggio(khunggio(giobatdau, gioketthuc))')
         .eq('madatsan', bookingId)
         .single();
 
@@ -433,8 +484,25 @@ app.post('/api/owner/settle-booking', async (req, res) => {
 
       const currentStatus = String(booking.trangthai || '').toUpperCase();
 
+      // Tính toán thời điểm kết thúc trận đấu (Asia/Ho_Chi_Minh)
+      const slots = booking.datsan_khunggio || [];
+      let latestEnd = '00:00:00';
+      for (const s of slots) {
+        const end = s.khunggio?.gioketthuc || '00:00:00';
+        if (end > latestEnd) latestEnd = end;
+      }
+
+      const now = new Date();
+      let matchHasEnded = false;
+      let endHourMin = '00:00';
+      if (latestEnd !== '00:00:00') {
+        endHourMin = latestEnd.slice(0, 5);
+        const matchEndDateTime = new Date(`${booking.ngaysudung}T${endHourMin}:00+07:00`);
+        matchHasEnded = now.getTime() >= matchEndDateTime.getTime();
+      }
+
       if (action === 'CONFIRM_CASH') {
-        // Kiểm tra tính hợp lệ của trạng thái trước khi xác nhận thu tiền
+        // TASK 02: Phân định rõ trạng thái thanh toán và trạng thái trận đấu.
         if (currentStatus === 'HOAN_THANH' || currentStatus === 'HOANTHANH') {
           return res.status(400).json({ error: 'Đơn đặt sân này đã được hoàn tất thi đấu trước đó.' });
         }
@@ -446,18 +514,25 @@ app.post('/api/owner/settle-booking', async (req, res) => {
         }
 
         meta.paymentMethod = 'TIEN_MAT';
+        meta.cashReceivedAt = new Date().toISOString();
         meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
         meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
-        meta.completedAt = new Date().toISOString();
+
+        // Quy tắc: Nếu trận đấu đã kết thúc thì chuyển sang HOAN_THANH. Nếu chưa kết thúc, giữ trạng thái CHO_THI_DAU.
+        const targetStatus = matchHasEnded ? 'HOAN_THANH' : 'CHO_THI_DAU';
+        if (matchHasEnded) {
+          meta.completedAt = new Date().toISOString();
+        }
+
         meta.statusHistory = [
           ...(meta.statusHistory || []),
-          { from: currentStatus, to: 'HOAN_THANH', action, by: callerUserId, role: authData.role, at: new Date().toISOString() }
+          { from: currentStatus, to: targetStatus, action, by: callerUserId, role: authData.role, at: new Date().toISOString() }
         ];
 
         const { data, error } = await adminSupabase.from('datsan').update({
-          trangthai: 'HOAN_THANH',
+          trangthai: targetStatus,
           ghichu: JSON.stringify(meta)
-        }).eq('madatsan', bookingId).select().single();
+        }).eq('madatsan', bookingId).eq('trangthai', booking.trangthai).select().single();
 
         if (error) throw error;
 
@@ -467,15 +542,75 @@ app.post('/api/owner/settle-booking', async (req, res) => {
           phuongthucthanhtoan: 'TIEN_MAT'
         }).eq('madatsan', bookingId);
 
-        console.log(`[Audit Log] Owner ${callerUserId} confirmed cash collection for booking ${bookingId}: ${currentStatus} -> HOAN_THANH`);
+        console.log(`[Audit Log] Owner ${callerUserId} confirmed cash collection for booking ${bookingId}: ${currentStatus} -> ${targetStatus} (Match ended: ${matchHasEnded})`);
 
         // Thông báo cho khách hàng
         try {
           if (booking.makhachhang) {
             await adminSupabase.from('thongbao').insert({
               manguoidung: booking.makhachhang,
+              tieude: matchHasEnded ? '✅ Trận đấu hoàn thành' : '💵 Xác nhận thanh toán tiền mặt',
+              noidung: matchHasEnded 
+                ? 'Chủ sân đã xác nhận thu tiền mặt và hoàn thành trận đấu. Cảm ơn bạn đã thi đấu!' 
+                : 'Chủ sân đã xác nhận nhận tiền mặt tại sân. Chúc bạn có trận đấu vui vẻ!',
+              loaithongbao: matchHasEnded ? 'MATCH_COMPLETED' : 'PAYMENT_RECEIVED'
+            });
+          }
+        } catch {}
+
+        return res.json({ success: true, data, matchHasEnded });
+      }
+
+      if (action === 'COMPLETE_MATCH') {
+        // TASK 02: Ngăn chặn Chủ sân hoàn tất sớm trận đấu khi trận đấu chưa diễn ra xong.
+        if (currentStatus === 'HOAN_THANH' || currentStatus === 'HOANTHANH') {
+          return res.status(400).json({ error: 'Đơn đặt sân này đã được hoàn tất thi đấu trước đó.' });
+        }
+        if (currentStatus === 'DA_HUY' || currentStatus === 'DAHUY') {
+          return res.status(400).json({ error: 'Không thể hoàn tất đơn đặt sân đã bị hủy.' });
+        }
+        if (latestEnd === '00:00:00') {
+          return res.status(400).json({ error: 'Không thể xác định khung giờ kết thúc của đơn đặt sân này để hoàn tất.' });
+        }
+        if (!matchHasEnded) {
+          return res.status(400).json({
+            error: `Trận đấu chưa kết thúc (Dự kiến kết thúc lúc ${endHourMin} ngày ${booking.ngaysudung}). Không thể hoàn tất sớm khi trận đấu chưa diễn ra xong.`,
+            code: 'ERR_MATCH_NOT_ENDED'
+          });
+        }
+
+        meta.completedAt = new Date().toISOString();
+        if (meta.paymentMethod === 'TIEN_MAT' || currentStatus === 'CHO_THI_DAU') {
+          meta.paymentMethod = 'TIEN_MAT';
+          meta.commissionStatus = 'CHO_CHUSAN_NOP';
+          meta.commissionAmount = Number(meta.commissionAmount || Math.round(Number(booking.tongtien || 0) * 0.1));
+        }
+
+        meta.statusHistory = [
+          ...(meta.statusHistory || []),
+          { from: currentStatus, to: 'HOAN_THANH', action, by: callerUserId, role: authData.role, at: new Date().toISOString() }
+        ];
+
+        const { data, error } = await adminSupabase.from('datsan').update({
+          trangthai: 'HOAN_THANH',
+          ghichu: JSON.stringify(meta)
+        }).eq('madatsan', bookingId).eq('trangthai', booking.trangthai).select().single();
+
+        if (error) throw error;
+
+        // Cập nhật thanh toán nếu chưa thanh toán
+        await adminSupabase.from('thanhtoan').update({
+          trangthai: 'DA_THANH_TOAN'
+        }).eq('madatsan', bookingId).eq('trangthai', 'CHO_THANH_TOAN');
+
+        console.log(`[Audit Log] Owner ${callerUserId} completed match for booking ${bookingId}: ${currentStatus} -> HOAN_THANH`);
+
+        try {
+          if (booking.makhachhang) {
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: booking.makhachhang,
               tieude: '✅ Trận đấu hoàn thành',
-              noidung: 'Chủ sân đã xác nhận thu tiền mặt và hoàn thành trận đấu. Cảm ơn bạn đã thi đấu!',
+              noidung: 'Trận đấu của bạn đã được hoàn tất. Cảm ơn bạn và đừng quên để lại đánh giá nhé!',
               loaithongbao: 'MATCH_COMPLETED'
             });
           }
@@ -777,6 +912,7 @@ app.post('/api/fields/register', async (req, res) => {
 });
 
 // HÀM TỰ ĐỘNG DUYỆT HOÀN TẤT KHI QUÁ GIỜ ĐẶT 1 TIẾNG (AUTO-COMPLETE)
+// TASK 02 (P0): Chỉ hoàn thành đơn sau khi khung giờ cuối cùng kết thúc, không đoán giờ, có khóa lạc quan.
 async function autoCompleteExpiredBookings() {
   if (!adminSupabase) return 0;
   try {
@@ -795,7 +931,7 @@ async function autoCompleteExpiredBookings() {
           khunggio (giobatdau, gioketthuc)
         )
       `)
-      .in('trangthai', ['CHO_THI_DAU', 'DA_THANH_TOAN', 'CHOXACNHAN', 'DACANCOC']);
+      .in('trangthai', ['CHO_THI_DAU', 'DA_THANH_TOAN', 'DACANCOC']);
 
     if (!bookings || bookings.length === 0) return 0;
 
@@ -810,7 +946,11 @@ async function autoCompleteExpiredBookings() {
         if (end > latestEnd) latestEnd = end;
       }
 
-      if (latestEnd === '00:00:00') latestEnd = '22:00:00';
+      // TASK 02: Nếu thông tin khung giờ bị thiếu, KHÔNG ĐƯỢC tự ý đoán 22:00:00, bỏ qua để kiểm tra thủ công.
+      if (latestEnd === '00:00:00') {
+        console.warn(`[Auto-Complete Guard] Bỏ qua đơn ${b.madatsan} do thiếu thông tin khung giờ kết thúc.`);
+        continue;
+      }
 
       const endHourMin = latestEnd.slice(0, 5);
       // Thời điểm kết thúc trận đấu (múi giờ +07:00)
@@ -830,10 +970,21 @@ async function autoCompleteExpiredBookings() {
           meta.commissionAmount = Number(meta.commissionAmount || Math.round(Number(b.tongtien || 0) * 0.1));
         }
 
-        await adminSupabase.from('datsan').update({
-          trangthai: 'HOAN_THANH',
-          ghichu: JSON.stringify(meta)
-        }).eq('madatsan', b.madatsan);
+        // TASK 02: Khóa lạc quan (Optimistic Concurrency Lock) - chỉ cập nhật nếu trạng thái chưa bị tiến trình khác đổi
+        const { data: updatedRows, error: updateErr } = await adminSupabase
+          .from('datsan')
+          .update({
+            trangthai: 'HOAN_THANH',
+            ghichu: JSON.stringify(meta)
+          })
+          .eq('madatsan', b.madatsan)
+          .eq('trangthai', b.trangthai)
+          .select();
+
+        if (updateErr || !updatedRows || updatedRows.length === 0) {
+          console.warn(`[Auto-Complete Guard] Đơn ${b.madatsan} bị thay đổi trạng thái đồng thời bởi tiến trình khác, bỏ qua.`);
+          continue;
+        }
 
         updatedCount++;
 
@@ -1062,10 +1213,12 @@ async function getAuthenticatedClient(req) {
   if (!token || !supabase) return null;
   const { data, error } = await supabase.auth.getUser(token);
   if (error || !data.user) return null;
-  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+  const client = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${token}` } },
     auth: { persistSession: false, autoRefreshToken: false },
   });
+  client.authUser = data.user;
+  return client;
 }
 
 async function getAuthenticatedProfile(req) {
@@ -1073,11 +1226,34 @@ async function getAuthenticatedProfile(req) {
   if (!authClient) return null;
   try {
     const { data: profile, error } = await authClient.rpc('ensure_current_nguoidung');
+    if (!error && profile) {
+      return { 
+        authClient, 
+        profile, 
+        role: String(profile?.vaitro || profile?.VaiTro || '').toUpperCase() 
+      };
+    }
+  } catch {
+    // Fallback if RPC is not present
+  }
+
+  // Fallback: lookup via adminSupabase or supabase by auth_user_id
+  try {
+    const client = adminSupabase || supabase;
+    const userId = authClient.authUser?.id;
+    if (!userId) return null;
+
+    const { data: profile, error } = await client
+      .from('nguoidung')
+      .select('*')
+      .eq('auth_user_id', userId)
+      .single();
+
     if (error || !profile) return null;
-    return { 
-      authClient, 
-      profile, 
-      role: String(profile?.vaitro || profile?.VaiTro || '').toUpperCase() 
+    return {
+      authClient,
+      profile,
+      role: String(profile?.vaitro || profile?.VaiTro || '').toUpperCase()
     };
   } catch {
     return null;
@@ -1316,6 +1492,94 @@ app.post('/api/data', async (req, res) => {
     const isSelfOrPitchFiltered = filters.some(f => ['makhachhang', 'masan'].includes(f.column));
     if (!isSelfOrPitchFiltered && userRole !== 'ADMIN') {
       return res.status(403).json({ error: 'Forbidden: Super Admin access required to view global bookings' });
+    }
+  }
+  if (table === 'datsan' && action === 'update') {
+    if (!authClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    const authData = await getAuthenticatedProfile(req);
+    const userRole = authData?.role;
+    if (values && ('trangthai' in values || 'TrangThai' in values) && userRole !== 'ADMIN') {
+      return res.status(403).json({ 
+        error: 'Forbidden: Trạng thái đơn đặt sân chỉ được cập nhật qua các quy trình nghiệp vụ chuyên biệt.' 
+      });
+    }
+  }
+
+  // 4. Bảng danhgia: Kiểm soát chặt chẽ điều kiện đánh giá (TASK 03 P0)
+  if (table === 'danhgia' && action === 'insert') {
+    if (!authClient) return res.status(401).json({ error: 'Valid Supabase access token required' });
+    const authData = await getAuthenticatedProfile(req);
+    if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing profile' });
+    const callerUserId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+    const userRole = authData.role;
+
+    const reviewItems = Array.isArray(values) ? values : [values];
+    for (const r of reviewItems) {
+      const targetBookingId = r?.madatsan || r?.MaDatSan;
+      if (!targetBookingId) {
+        return res.status(400).json({ error: 'Đánh giá phải gắn liền với một đơn đặt sân hợp lệ (madatsan).' });
+      }
+
+      // Kiểm tra đơn đặt sân
+      const { data: booking, error: bErr } = await (adminSupabase || supabase)
+        .from('datsan')
+        .select('*, datsan_khunggio(khunggio(gioketthuc))')
+        .eq('madatsan', targetBookingId)
+        .single();
+
+      if (bErr || !booking) {
+        return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân tương ứng để đánh giá.' });
+      }
+
+      // Phải là chính khách hàng sở hữu đơn (hoặc ADMIN)
+      const bookingCustomerId = Number(booking.makhachhang);
+      if (userRole !== 'ADMIN' && bookingCustomerId !== callerUserId) {
+        return res.status(403).json({ error: 'Bạn chỉ có thể đánh giá đơn đặt sân của chính mình.' });
+      }
+
+      // Trạng thái đơn bắt buộc phải là HOAN_THANH / HOANTHANH
+      const bookingStatus = String(booking.trangthai || '').toUpperCase();
+      if (bookingStatus !== 'HOAN_THANH' && bookingStatus !== 'HOANTHANH') {
+        return res.status(400).json({
+          error: 'Chỉ các đơn đặt sân đã hoàn tất thi đấu (HOAN_THANH) mới được phép gửi đánh giá. Các trạng thái khác chưa đủ điều kiện đánh giá.',
+          code: 'ERR_BOOKING_NOT_COMPLETED',
+          currentStatus: bookingStatus
+        });
+      }
+
+      // Kiểm tra thời gian thi đấu đã kết thúc
+      const slots = booking.datsan_khunggio || [];
+      let latestEnd = '00:00:00';
+      for (const s of slots) {
+        const end = s.khunggio?.gioketthuc || '00:00:00';
+        if (end > latestEnd) latestEnd = end;
+      }
+
+      if (latestEnd !== '00:00:00') {
+        const endHourMin = latestEnd.slice(0, 5);
+        const matchEndDateTime = new Date(`${booking.ngaysudung}T${endHourMin}:00+07:00`);
+        const now = new Date();
+        if (now.getTime() < matchEndDateTime.getTime()) {
+          return res.status(400).json({
+            error: `Trận đấu chưa kết thúc (Dự kiến kết thúc lúc ${endHourMin} ngày ${booking.ngaysudung}). Vui lòng trải nghiệm trận đấu trước khi đánh giá.`,
+            code: 'ERR_MATCH_NOT_ENDED'
+          });
+        }
+      }
+
+      // Chống đánh giá trùng lặp
+      const { data: existingReview } = await (adminSupabase || supabase)
+        .from('danhgia')
+        .select('madanhgia')
+        .eq('madatsan', targetBookingId)
+        .maybeSingle();
+
+      if (existingReview) {
+        return res.status(400).json({
+          error: 'Đơn đặt sân này đã được đánh giá trước đó. Mỗi đơn chỉ được gửi đánh giá một lần.',
+          code: 'ERR_DUPLICATE_REVIEW'
+        });
+      }
     }
   }
   if (action === 'insert' && ['datsan', 'datsan_khunggio'].includes(table)) {
