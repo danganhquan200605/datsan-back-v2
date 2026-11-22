@@ -46,6 +46,26 @@ app.use(cors({ origin(origin, callback) {
 } }));
 app.use(express.json({ limit: '1mb' }));
 
+// MAINTENANCE MODE GUARD (Protects state mutations during controlled migration windows)
+app.use((req, res, next) => {
+  const isMaintenanceActive = process.env.MAINTENANCE_MODE === 'true';
+  if (!isMaintenanceActive) return next();
+
+  // Allow read-only paths and system health checks
+  if (req.method === 'GET' || req.path === '/' || req.path === '/api/health' || req.path === '/api/mock-payment/config') {
+    return next();
+  }
+
+  // Intercept write operations during maintenance
+  return res.status(503).json({
+    success: false,
+    status: 503,
+    code: 'ERR_MAINTENANCE_MODE',
+    error: 'Hệ thống đang trong cửa sổ nâng cấp Hotfix V2 có kiểm soát. Các giao dịch ghi (đặt sân, hủy đơn, hoàn tiền, thanh toán) tạm thời được bảo lưu an toàn. Vui lòng thử lại sau ít phút.',
+    maintenance: true
+  });
+});
+
 app.get('/', (_req, res) => res.json({ name: 'datsan-back-v2', status: 'ok' }));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 
