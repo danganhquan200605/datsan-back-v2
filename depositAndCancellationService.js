@@ -884,7 +884,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
 
     const updRes = await client.query(`
       UPDATE datsan 
-      SET trangthai = 'DA_HUY', ghichu = $1, updated_at = NOW() 
+      SET trangthai = 'DA_HUY', ghichu = $1 
       WHERE madatsan = $2 AND trangthai = $3
       RETURNING *
     `, [JSON.stringify(meta), bookingId, booking.trangthai]);
@@ -1263,7 +1263,7 @@ async function processPartialCustomerCancellation({
     // Cập nhật tổng tiền đơn đặt sân trong cùng PostgreSQL Transaction
     const updRes = await client.query(`
       UPDATE datsan
-      SET tongtien = $1, ghichu = $2, updated_at = NOW()
+      SET tongtien = $1, ghichu = $2
       WHERE madatsan = $3 AND (trangthai = 'CHO_THI_DAU' OR trangthai = 'CHOXACNHAN' OR trangthai = 'DA_THANH_TOAN')
       RETURNING *
     `, [newTotal, JSON.stringify(meta), bookingId]);
