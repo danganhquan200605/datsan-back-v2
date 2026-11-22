@@ -51,12 +51,28 @@ app.use((req, res, next) => {
   const isMaintenanceActive = process.env.MAINTENANCE_MODE === 'true';
   if (!isMaintenanceActive) return next();
 
-  // Allow read-only paths and system health checks
-  if (req.method === 'GET' || req.path === '/' || req.path === '/api/health' || req.path === '/api/mock-payment/config') {
+  // Explicitly allow health and safe informational probes
+  if (req.path === '/' || req.path === '/api/health' || req.path === '/api/mock-payment/config') {
     return next();
   }
 
-  // Intercept write operations during maintenance
+  // Block mutating GET endpoints identified during security audit
+  if (req.path === '/api/owner/deposit') {
+    return res.status(503).json({
+      success: false,
+      status: 503,
+      code: 'ERR_MAINTENANCE_MODE',
+      error: 'Hệ thống đang trong cửa sổ nâng cấp Hotfix V2 có kiểm soát. Ký quỹ tạm thời không thể khởi tạo trong bảo trì.',
+      maintenance: true
+    });
+  }
+
+  // Allow other pure read-only GET requests (browsing courts, availability, notifications)
+  if (req.method === 'GET') {
+    return next();
+  }
+
+  // Intercept all write operations (POST, PUT, PATCH, DELETE) during maintenance
   return res.status(503).json({
     success: false,
     status: 503,
@@ -991,6 +1007,7 @@ app.post('/api/fields/register', async (req, res) => {
 // HÀM TỰ ĐỘNG DUYỆT HOÀN TẤT KHI QUÁ GIỜ ĐẶT 1 TIẾNG (AUTO-COMPLETE)
 // TASK 02 (P0): Chỉ hoàn thành đơn sau khi khung giờ cuối cùng kết thúc, không đoán giờ, có khóa lạc quan.
 async function autoCompleteExpiredBookings() {
+  if (process.env.MAINTENANCE_MODE === 'true') return 0;
   if (!adminSupabase) return 0;
   try {
     const { data: bookings } = await adminSupabase
@@ -1099,6 +1116,7 @@ async function autoCompleteExpiredBookings() {
 
 // HÀM TỰ ĐỘNG GỬI THÔNG BÁO NHẮC NỢ KHI QUÁ HẠN 1 TUẦN (7 NGÀY)
 async function autoSendOverdueDebtReminders() {
+  if (process.env.MAINTENANCE_MODE === 'true') return 0;
   if (!adminSupabase) return 0;
   try {
     const { data: bookings, error } = await adminSupabase
@@ -1190,11 +1208,13 @@ async function autoSendOverdueDebtReminders() {
 
 // Chạy tự động kiểm tra mỗi 30 giây (duyệt ca quá hạn & gửi nhắc nợ quá hạn 1 tuần)
 setInterval(async () => {
+  if (process.env.MAINTENANCE_MODE === 'true') return;
   await autoCompleteExpiredBookings();
   await autoSendOverdueDebtReminders();
 }, 30000);
 
 setTimeout(async () => {
+  if (process.env.MAINTENANCE_MODE === 'true') return;
   await autoCompleteExpiredBookings();
   await autoSendOverdueDebtReminders();
 }, 3000);
