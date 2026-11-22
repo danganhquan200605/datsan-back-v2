@@ -277,18 +277,31 @@ app.post('/api/bookings', async (req, res) => {
     }
   }
 
-  // TASK 03: Kiểm tra giới hạn 120 phút cho hình thức thanh toán TIEN_MAT
+  // TASK 03: Kiểm tra giới hạn 120 phút cho hình thức thanh toán TIEN_MAT (FAIL-CLOSED)
   if (paymentMethod === 'TIEN_MAT') {
     let slotsForDuration = slotRows;
-    if (!slotsForDuration) {
-      const { data: dbSlots } = await (adminSupabase || supabase)
+    if (!slotsForDuration || slotsForDuration.length !== slots.length) {
+      const { data: dbSlots, error: dbSlotsErr } = await (adminSupabase || supabase)
         .from('khunggio')
         .select('makhunggio, giobatdau, gioketthuc')
         .eq('masan', masan)
         .in('makhunggio', slots.map(Number));
-      slotsForDuration = dbSlots || [];
+      if (dbSlotsErr || !dbSlots || dbSlots.length !== slots.length) {
+        return res.status(400).json({
+          error: 'Không thể xác thực đầy đủ thông tin khung giờ để áp dụng thanh toán tiền mặt. Vui lòng thử lại.',
+          code: 'ERR_CASH_SLOT_VALIDATION_FAILED'
+        });
+      }
+      slotsForDuration = dbSlots;
     }
     const totalDurationMinutes = calculateDurationMinutesFromSlots(slotsForDuration);
+    if (totalDurationMinutes <= 0) {
+      return res.status(400).json({
+        error: 'Khung giờ đặt sân không hợp lệ: Thời lượng phải lớn hơn 0 phút.',
+        code: 'ERR_INVALID_SLOT_DURATION',
+        totalDurationMinutes
+      });
+    }
     if (totalDurationMinutes > 120) {
       return res.status(400).json({
         error: `Thanh toán tiền mặt chỉ áp dụng cho đơn đặt sân tối đa 2 giờ (120 phút). Đơn hiện tại có thời lượng ${totalDurationMinutes} phút. Vui lòng giảm thời lượng hoặc chọn thanh toán trực tuyến.`,
