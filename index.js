@@ -18,7 +18,8 @@ const {
 } = require('./otpSecurity');
 const {
   checkCourtDepositEligibility,
-  getOrCreateOwnerDeposit
+  getOrCreateOwnerDeposit,
+  calculateDurationMinutesFromSlots
 } = require('./depositAndCancellationService');
 const mountDepositAndCancellationRoutes = require('./routes/depositAndCancellationRoutes');
 
@@ -243,13 +244,15 @@ app.post('/api/bookings', async (req, res) => {
   }
 
   // 2. Nếu đặt cho ngày hôm nay: kiểm tra từng khung giờ bắt đầu phải lớn hơn thời gian hiện tại
+  let slotRows = null;
   if (date === vnDateStr) {
-    const { data: slotRows, error: slotErr } = await (adminSupabase || supabase)
+    const { data: fetchedSlots, error: slotErr } = await (adminSupabase || supabase)
       .from('khunggio')
       .select('makhunggio, giobatdau, gioketthuc')
       .eq('masan', masan)
       .in('makhunggio', slots.map(Number));
 
+    slotRows = fetchedSlots;
     if (slotErr || !slotRows || slotRows.length !== slots.length) {
       return res.status(400).json({ 
         error: 'Một hoặc nhiều khung giờ không tồn tại trên sân này.', 
@@ -270,6 +273,27 @@ app.post('/api/bookings', async (req, res) => {
         error: `Khung giờ ${slotStart} đã qua hoặc đang diễn ra (Giờ hiện tại: ${vnTimeStr.slice(0, 5)}). Chỉ được đặt khung giờ có thời gian bắt đầu trong tương lai.`,
         code: 'ERR_PAST_SLOT',
         invalidSlot: pastSlot.makhunggio
+      });
+    }
+  }
+
+  // TASK 03: Kiểm tra giới hạn 120 phút cho hình thức thanh toán TIEN_MAT
+  if (paymentMethod === 'TIEN_MAT') {
+    let slotsForDuration = slotRows;
+    if (!slotsForDuration) {
+      const { data: dbSlots } = await (adminSupabase || supabase)
+        .from('khunggio')
+        .select('makhunggio, giobatdau, gioketthuc')
+        .eq('masan', masan)
+        .in('makhunggio', slots.map(Number));
+      slotsForDuration = dbSlots || [];
+    }
+    const totalDurationMinutes = calculateDurationMinutesFromSlots(slotsForDuration);
+    if (totalDurationMinutes > 120) {
+      return res.status(400).json({
+        error: `Thanh toán tiền mặt chỉ áp dụng cho đơn đặt sân tối đa 2 giờ (120 phút). Đơn hiện tại có thời lượng ${totalDurationMinutes} phút. Vui lòng giảm thời lượng hoặc chọn thanh toán trực tuyến.`,
+        code: 'ERR_CASH_DURATION_LIMIT',
+        totalDurationMinutes
       });
     }
   }

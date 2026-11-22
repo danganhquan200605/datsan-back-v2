@@ -318,10 +318,16 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
 
       const { data: slotLinks } = await adminSupabase
         .from('datsan_khunggio')
-        .select('khunggio (giobatdau, gioketthuc)')
+        .select('*, khunggio (*)')
         .eq('madatsan', bookingId);
 
-      const slots = (slotLinks || []).map(sl => sl.khunggio).filter(Boolean);
+      const slots = (slotLinks || []).map(sl => ({
+        makhunggio: sl.makhunggio || sl.khunggio?.makhunggio,
+        giobatdau: sl.khunggio?.giobatdau,
+        gioketthuc: sl.khunggio?.gioketthuc,
+        giadat: sl.giadat ?? sl.giatien ?? sl.giaapdung
+      })).filter(s => s.giobatdau);
+
       const check = service.checkCancellationEligibility({ booking, slots, customerId });
 
       return res.json({
@@ -332,6 +338,7 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
         hoursRemaining: check.hoursRemaining,
         isOnlinePaid: check.isOnlinePaid,
         refundAmount: check.refundAmount,
+        slots: check.slots || [],
         bookingSummary: {
           madatsan: booking.madatsan,
           tensan: booking.san?.tensan,
@@ -370,6 +377,37 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
     } catch (err) {
       console.error('Error processing customer cancellation:', err);
       return res.status(500).json({ error: 'Lỗi xử lý hủy đặt sân' });
+    }
+  });
+
+  // 2.3 Khách hàng: Thực hiện hủy một phần khung giờ (TASK 02 Partial Cancellation)
+  app.post('/api/customer/cancel-partial-booking', async (req, res) => {
+    const authData = await getAuthenticatedProfile(req);
+    if (!authData) return res.status(401).json({ error: 'Unauthorized: Vui lòng đăng nhập' });
+
+    const customerId = authData.profile?.manguoidung || authData.profile?.MaNguoiDung;
+    const { bookingId, slotIds, reason, bankName, bankAccount, accountHolder } = req.body || {};
+
+    if (!bookingId) return res.status(400).json({ error: 'Thiếu mã đơn đặt sân' });
+    if (!Array.isArray(slotIds) || slotIds.length === 0) {
+      return res.status(400).json({ error: 'Vui lòng chọn ít nhất một khung giờ cần hủy' });
+    }
+
+    try {
+      const result = await service.processPartialCustomerCancellation({
+        bookingId: Number(bookingId),
+        customerId,
+        slotIds: slotIds.map(Number),
+        refundAccountInfo: { bankName, bankAccount, accountHolder },
+        reason,
+        adminSupabase
+      });
+
+      if (!result.success) return res.status(result.status || 400).json(result);
+      return res.json(result);
+    } catch (err) {
+      console.error('Error processing partial cancellation:', err);
+      return res.status(500).json({ error: 'Lỗi xử lý điều chỉnh khung giờ' });
     }
   });
 

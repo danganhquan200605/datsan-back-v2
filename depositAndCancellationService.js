@@ -72,12 +72,12 @@ function getMockQrSvgDataUrl(amount, transferContent) {
     <rect x="35" y="210" width="55" height="55" fill="#0f172a" rx="6"/>
     <rect x="45" y="220" width="35" height="35" fill="#ffffff" rx="3"/>
     <rect x="52" y="227" width="21" height="21" fill="#0f172a"/>
-    <rect x="25" y="105" width="250" height="90" fill="#fee2e2" stroke="#ef4444" stroke-width="1.5" rx="10"/>
-    <text x="150" y="132" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="#b91c1c" text-anchor="middle">⚡ MÔ PHỎNG THANH TOÁN ⚡</text>
-    <text x="150" y="153" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#7f1d1d" text-anchor="middle">KHÔNG QUÉT BẰNG APP NGÂN HÀNG THẬT</text>
-    <text x="150" y="174" font-family="system-ui, sans-serif" font-size="10" fill="#991b1b" text-anchor="middle">Bấm "Thanh toán mô phỏng" để duyệt ngay</text>
-    <text x="150" y="245" font-family="system-ui, sans-serif" font-size="12" font-weight="bold" fill="#0284c7" text-anchor="middle">DEMO FINANCIAL GATEWAY</text>
-    <text x="150" y="265" font-family="system-ui, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">${formattedAmount} đ</text>
+    <rect x="25" y="105" width="250" height="85" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" rx="10"/>
+    <text x="150" y="132" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="#15803d" text-anchor="middle">THANH TOÁN KÝ QUỸ</text>
+    <text x="150" y="153" font-family="system-ui, sans-serif" font-size="10" font-weight="600" fill="#166534" text-anchor="middle">Giao dịch thử nghiệm – không phát sinh tiền thật</text>
+    <text x="150" y="174" font-family="system-ui, sans-serif" font-size="10" fill="#475569" text-anchor="middle">Nội dung: ${transferContent}</text>
+    <text x="150" y="245" font-family="system-ui, sans-serif" font-size="12" font-weight="bold" fill="#0284c7" text-anchor="middle">DATSAN ONLINE</text>
+    <text x="150" y="265" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="#0f172a" text-anchor="middle">${formattedAmount} đ</text>
   </svg>`;
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
@@ -628,7 +628,24 @@ async function adminSettleDepositRefund(adminId, { ownerId, isApproved, refundAm
 // ============================================================================
 
 /**
- * Kiểm tra điều kiện tự hủy đặt sân của Khách hàng
+ * Tính tổng thời lượng (phút) của các khung giờ
+ */
+function calculateDurationMinutesFromSlots(slotRows = []) {
+  if (!Array.isArray(slotRows) || slotRows.length === 0) return 0;
+  return slotRows.reduce((total, s) => {
+    const startStr = String(s.giobatdau || s.start || '').slice(0, 5);
+    const endStr = String(s.gioketthuc || s.end || '').slice(0, 5);
+    if (!startStr || !endStr) return total;
+    const [startH, startM] = startStr.split(':').map(Number);
+    const [endH, endM] = endStr.split(':').map(Number);
+    let diff = (endH * 60 + endM) - (startH * 60 + startM);
+    if (diff < 0) diff += 24 * 60;
+    return total + (diff > 0 ? diff : 0);
+  }, 0);
+}
+
+/**
+ * Kiểm tra điều kiện tự hủy đặt sân của Khách hàng (Hỗ trợ cả hủy toàn bộ và hủy từng phần)
  */
 function checkCancellationEligibility({ booking, slots, customerId, serverNow = new Date() }) {
   if (!booking) {
@@ -651,20 +668,35 @@ function checkCancellationEligibility({ booking, slots, customerId, serverNow = 
     return { eligible: false, status: 400, reason: `Không thể hủy đơn đặt sân ở trạng thái: ${status}. Chỉ áp dụng cho đơn chưa diễn ra.` };
   }
 
-  // 3. Tính toán thời gian còn lại đến giờ đá
-  let earliestStart = null;
+  // 3. Tính toán thời gian còn lại cho từng khung giờ
   const bookingDateStr = booking.ngaysudung;
-
-  if (slots && slots.length > 0) {
-    for (const slot of slots) {
-      if (slot && slot.giobatdau) {
-        const timePart = slot.giobatdau.length === 5 ? slot.giobatdau + ':00' : slot.giobatdau;
-        const slotDateTimeStr = `${bookingDateStr}T${timePart}+07:00`;
-        const slotDate = new Date(slotDateTimeStr);
-        if (!earliestStart || slotDate < earliestStart) earliestStart = slotDate;
-      }
+  let earliestStart = null;
+  const slotDetails = (slots || []).map(slot => {
+    let hoursRemaining = null;
+    let canCancel = false;
+    let startStr = String(slot.giobatdau || '').slice(0, 5);
+    let endStr = String(slot.gioketthuc || '').slice(0, 5);
+    if (slot && slot.giobatdau) {
+      const timePart = slot.giobatdau.length === 5 ? slot.giobatdau + ':00' : slot.giobatdau;
+      const slotDateTimeStr = `${bookingDateStr}T${timePart}+07:00`;
+      const slotDate = new Date(slotDateTimeStr);
+      if (!earliestStart || slotDate < earliestStart) earliestStart = slotDate;
+      const diffMs = slotDate.getTime() - serverNow.getTime();
+      hoursRemaining = diffMs / (1000 * 60 * 60);
+      canCancel = hoursRemaining >= 4.0;
     }
-  }
+    return {
+      makhunggio: Number(slot.makhunggio),
+      giobatdau: startStr,
+      gioketthuc: endStr,
+      giadat: Number(slot.giadat || slot.giatien || slot.giaapdung || 0),
+      hoursRemaining: hoursRemaining !== null ? Number(hoursRemaining.toFixed(1)) : null,
+      canCancel,
+      reason: canCancel 
+        ? `Hợp lệ tự hủy (còn ${hoursRemaining.toFixed(1)}h)`
+        : `Không thể hủy (còn ${hoursRemaining !== null ? hoursRemaining.toFixed(1) : 0}h, vi phạm quy định tối thiểu 4h)`
+    };
+  });
 
   if (!earliestStart) {
     earliestStart = new Date(`${bookingDateStr}T06:00:00+07:00`);
@@ -673,23 +705,20 @@ function checkCancellationEligibility({ booking, slots, customerId, serverNow = 
   const diffMs = earliestStart.getTime() - serverNow.getTime();
   const hoursRemaining = diffMs / (1000 * 60 * 60);
 
-  if (hoursRemaining < 4.0) {
-    const formattedHours = hoursRemaining.toFixed(1);
-    return {
-      eligible: false,
-      status: 400,
-      hoursRemaining,
-      reason: `Đã quá thời hạn tự hủy sân. Chỉ được hủy trước giờ thi đấu tối thiểu 4 tiếng (Hiện tại chỉ còn ${formattedHours} tiếng).`
-    };
-  }
-
   const isOnlinePaid = status === 'DA_THANH_TOAN';
+  const overallEligible = hoursRemaining >= 4.0;
+
   return {
-    eligible: true,
-    hoursRemaining,
+    eligible: overallEligible,
+    status: overallEligible ? 200 : 400,
+    hoursRemaining: Number(hoursRemaining.toFixed(1)),
     isOnlinePaid,
     refundAmount: isOnlinePaid ? Number(booking.tongtien || 0) : 0,
-    booking
+    booking,
+    slots: slotDetails,
+    reason: overallEligible
+      ? `Hợp lệ tự hủy toàn bộ đơn (Còn ${hoursRemaining.toFixed(1)} giờ trước giờ bắt đầu sớm nhất)`
+      : `Đã quá thời hạn tự hủy sân. Chỉ được hủy trước giờ thi đấu tối thiểu 4 tiếng (Hiện tại chỉ còn ${hoursRemaining.toFixed(1)} tiếng).`
   };
 }
 
@@ -708,15 +737,19 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     // Các request đồng thời trên cùng bookingId BẮT BUỘC xếp hàng đợi
     await client.query('SELECT pg_advisory_xact_lock(32984, $1)', [bookingId]);
 
-    // 2. Kiểm tra Idempotency: Bản ghi hoàn tiền đã tồn tại chưa?
-    const { rows: existingRf } = await client.query('SELECT * FROM hoantien WHERE madatsan = $1', [bookingId]);
-    if (existingRf.length > 0) {
+    // 2. Kiểm tra Idempotency: Bản ghi hoàn tiền toàn bộ (CANCEL_FULL) đã tồn tại chưa?
+    const fullCancelKey = `CANCEL_FULL_${bookingId}`;
+    const { rows: existingFullRf } = await client.query(
+      'SELECT * FROM hoantien WHERE idempotency_key = $1',
+      [fullCancelKey]
+    );
+    if (existingFullRf.length > 0) {
       await client.query('ROLLBACK');
       return {
         success: false,
         status: 400,
         code: 'ALREADY_CANCELLED',
-        message: 'Đơn đặt sân này đã được hủy và đang được xử lý hoàn tiền (Idempotency protection).'
+        message: 'Đơn đặt sân này đã được hủy toàn bộ và đang được xử lý hoàn tiền (Idempotency protection).'
       };
     }
 
@@ -743,13 +776,14 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
       };
     }
 
-    // 5. Lấy khung giờ của đơn đặt sân
+    // 5. Lấy khung giờ của đơn đặt sân (Schema-agnostic: *, khunggio (*))
     const { data: slotLinks } = await adminSupabase
       .from('datsan_khunggio')
-      .select('makhunggio, khunggio (giobatdau, gioketthuc)')
+      .select('*, khunggio (*)')
       .eq('madatsan', bookingId);
 
     const slots = (slotLinks || []).map(sl => sl.khunggio).filter(Boolean);
+    const remainingSlotIds = (slotLinks || []).map(sl => Number(sl.makhunggio || sl.khunggio?.makhunggio)).filter(Boolean);
 
     // 6. Kiểm tra điều kiện hủy
     const check = checkCancellationEligibility({ booking, slots, customerId });
@@ -819,9 +853,9 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
 
       const rfRes = await client.query(`
         INSERT INTO hoantien 
-        (madatsan, makhachhang, machusan, sotien_canhoan, sotien_dahoan, lydo_huy, trangthai, nganhang_nhan, sotaikhoan_nhan, chutaikhoan_nhan, han_xuly)
-        VALUES ($1, $2, $3, $4, 0.00, $5, 'CHO_HOAN', $6, $7, $8, $9)
-        ON CONFLICT (madatsan) DO NOTHING
+        (madatsan, makhachhang, machusan, sotien_canhoan, sotien_dahoan, lydo_huy, trangthai, nganhang_nhan, sotaikhoan_nhan, chutaikhoan_nhan, han_xuly, idempotency_key, slot_ids)
+        VALUES ($1, $2, $3, $4, 0.00, $5, 'CHO_HOAN', $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING *, mahoantien AS id, sotien_canhoan AS sotien_hoan, chutaikhoan_nhan AS tentaikhoan_nhan
       `, [
         bookingId,
@@ -832,10 +866,19 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
         bankName || 'MOCK_BANK',
         bankAccount || '0000000000',
         accountHolder || 'KHACH HANG',
-        deadline
+        deadline,
+        fullCancelKey,
+        remainingSlotIds
       ]);
 
       refundRecord = rfRes.rows[0];
+      if (!refundRecord) {
+        const existing = await client.query(
+          'SELECT *, mahoantien AS id, sotien_canhoan AS sotien_hoan, chutaikhoan_nhan AS tentaikhoan_nhan FROM hoantien WHERE idempotency_key = $1',
+          [fullCancelKey]
+        );
+        refundRecord = existing.rows[0] || null;
+      }
 
       if (ownerId) {
         await adminSupabase.from('thongbao').insert({
@@ -876,6 +919,301 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
       message: 'Hủy đơn đặt sân thành công 100%. Khung giờ đã được giải phóng.',
       isOnlinePaid,
       refund: refundRecord
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * TASK 02: Hủy một phần khung giờ đặt sân (Partial Cancellation)
+ * Áp dụng PostgreSQL Transaction + Advisory Lock (pg_advisory_xact_lock 32984)
+ * Giải phóng các khung giờ được chọn, tính lại tổng tiền, tạo bản ghi hoàn tiền nếu đã thanh toán QR
+ */
+async function processPartialCustomerCancellation({
+  bookingId,
+  customerId,
+  slotIds = [],
+  refundAccountInfo,
+  reason,
+  adminSupabase
+}) {
+  if (!Array.isArray(slotIds) || slotIds.length === 0) {
+    return { success: false, status: 400, message: 'Vui lòng chọn ít nhất một khung giờ cần hủy.' };
+  }
+
+  const normalizedSlotIds = slotIds.map(Number);
+  const client = await localPool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Transaction-level Advisory Lock (Namespace 32984)
+    await client.query('SELECT pg_advisory_xact_lock(32984, $1)', [bookingId]);
+
+    // 2. Lấy thông tin đơn đặt sân
+    const { data: booking, error: bErr } = await adminSupabase
+      .from('datsan')
+      .select('*, san (tensan, machusan, giasan)')
+      .eq('madatsan', bookingId)
+      .single();
+
+    if (bErr || !booking) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 404, message: 'Không tìm thấy đơn đặt sân' };
+    }
+
+    // 3. Kiểm tra quyền sở hữu (Anti-IDOR)
+    const bookingCustId = Number(booking.makhachhang || booking.manguoidung);
+    if (bookingCustId !== Number(customerId)) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 403, message: 'Bạn không có quyền thao tác trên đơn đặt sân của khách hàng khác.' };
+    }
+
+    // 4. Kiểm tra trạng thái đơn
+    const validStatuses = ['CHO_THI_DAU', 'CHOXACNHAN', 'DA_THANH_TOAN'];
+    if (!validStatuses.includes(booking.trangthai)) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 400, message: `Không thể điều chỉnh đơn ở trạng thái ${booking.trangthai}.` };
+    }
+
+    // 5. Lấy danh sách khung giờ đang hoạt động của đơn (Schema-agnostic: *, khunggio (*))
+    const { data: slotRows, error: sErr } = await adminSupabase
+      .from('datsan_khunggio')
+      .select('*, khunggio (*)')
+      .eq('madatsan', bookingId);
+
+    if (sErr || !slotRows || slotRows.length === 0) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 400, message: 'Đơn đặt sân không còn khung giờ nào đang hoạt động.' };
+    }
+
+    // Kiểm tra tất cả slotIds có thuộc đơn này không
+    const currentActiveSlotIds = slotRows.map(r => Number(r.makhunggio || r.khunggio?.makhunggio));
+    for (const sid of normalizedSlotIds) {
+      if (!currentActiveSlotIds.includes(sid)) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          status: 400,
+          code: 'ERR_SLOT_NOT_FOUND',
+          message: `Khung giờ #${sid} không thuộc đơn đặt sân này hoặc đã được giải phóng.`
+        };
+      }
+    }
+
+    // Kiểm tra slotIds có bị hoàn tiền trùng lặp từ trước không (Triple Protection)
+    const { rows: priorRefunds } = await client.query(
+      'SELECT slot_ids FROM hoantien WHERE madatsan = $1 AND slot_ids IS NOT NULL',
+      [bookingId]
+    );
+    const alreadyRefundedSlotIds = new Set();
+    for (const pr of priorRefunds) {
+      if (Array.isArray(pr.slot_ids)) {
+        pr.slot_ids.forEach(id => alreadyRefundedSlotIds.add(Number(id)));
+      }
+    }
+    for (const sid of normalizedSlotIds) {
+      if (alreadyRefundedSlotIds.has(sid)) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          status: 400,
+          code: 'ERR_SLOT_ALREADY_REFUNDED',
+          message: `Khung giờ #${sid} đã được hoàn tiền trước đó. Không được hoàn tiền trùng lặp.`
+        };
+      }
+    }
+
+    // 6. Kiểm tra quy tắc 4 tiếng cho từng khung giờ cần hủy (Asia/Ho_Chi_Minh)
+    const now = new Date();
+    const bookingDateStr = booking.ngaysudung;
+    const slotsToCancel = slotRows.filter(r => normalizedSlotIds.includes(Number(r.makhunggio || r.khunggio?.makhunggio)));
+
+    for (const row of slotsToCancel) {
+      const kg = row.khunggio || {};
+      const startStr = String(kg.giobatdau || '').slice(0, 8);
+      const timePart = startStr.length === 5 ? startStr + ':00' : startStr;
+      const slotDateTimeStr = `${bookingDateStr}T${timePart}+07:00`;
+      const slotDate = new Date(slotDateTimeStr);
+      const diffMs = slotDate.getTime() - now.getTime();
+      const hoursRemaining = diffMs / (1000 * 60 * 60);
+
+      if (hoursRemaining < 4.0) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          status: 400,
+          code: 'ERR_CANCELLATION_DEADLINE',
+          message: `Khung giờ ${startStr.slice(0, 5)} chỉ còn ${hoursRemaining.toFixed(1)} tiếng trước giờ thi đấu. Chỉ được hủy trước tối thiểu 4 tiếng.`
+        };
+      }
+    }
+
+    // 7. Nếu hủy TẤT CẢ các khung giờ còn lại -> chuyển sang hủy toàn bộ
+    if (normalizedSlotIds.length >= currentActiveSlotIds.length) {
+      await client.query('ROLLBACK');
+      return await processCustomerCancellation({
+        bookingId,
+        customerId,
+        refundAccountInfo,
+        reason: reason || 'Khách hàng hủy toàn bộ các khung giờ trong đơn',
+        adminSupabase
+      });
+    }
+
+    // 8. Hủy một phần: Tính số tiền hoàn/giảm dựa trên giá đã khóa lúc đặt (giadat / giatien / giaapdung / gia)
+    let refundAmount = 0;
+    for (const row of slotsToCancel) {
+      let price = Number(row.giadat ?? row.giatien ?? row.giaapdung ?? row.gia ?? 0);
+      if (price <= 0 && booking.san?.giasan) {
+        const kg = row.khunggio || {};
+        const [sh, sm] = String(kg.giobatdau || '00:00').split(':').map(Number);
+        const [eh, em] = String(kg.gioketthuc || '00:00').split(':').map(Number);
+        let mins = (eh * 60 + em) - (sh * 60 + sm);
+        if (mins < 0) mins += 1440;
+        price = Math.round((Number(booking.san.giasan) * mins) / 60);
+      }
+      refundAmount += price;
+    }
+
+    const currentTotal = Number(booking.tongtien || 0);
+    const newTotal = Math.max(0, currentTotal - refundAmount);
+
+    let meta = {};
+    try { meta = JSON.parse(booking.ghichu || '{}'); } catch (e) {}
+
+    const isOnlinePaid = booking.trangthai === 'DA_THANH_TOAN';
+    meta.partialCancellations = [
+      ...(meta.partialCancellations || []),
+      {
+        slotIds: normalizedSlotIds,
+        refundAmount,
+        cancelledAt: now.toISOString(),
+        reason: reason || 'Khách hàng điều chỉnh hủy một phần khung giờ'
+      }
+    ];
+
+    if (booking.trangthai === 'CHO_THI_DAU') {
+      meta.remainingAmount = newTotal;
+      meta.commissionAmount = Math.round(newTotal * 0.1);
+    } else if (isOnlinePaid) {
+      meta.commissionAmount = Math.round(newTotal * 0.1);
+      meta.paidAmount = newTotal;
+    }
+
+    // Cập nhật tổng tiền đơn đặt sân
+    const { data: updatedBooking, error: updErr } = await adminSupabase
+      .from('datsan')
+      .update({
+        tongtien: newTotal,
+        ghichu: JSON.stringify(meta)
+      })
+      .eq('madatsan', bookingId)
+      .select();
+
+    if (updErr || !updatedBooking || updatedBooking.length === 0) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 500, message: 'Lỗi cập nhật giá trị đơn đặt sân sau khi điều chỉnh khung giờ.' };
+    }
+
+    // Giải phóng các khung giờ bị hủy khỏi datsan_khunggio
+    const { error: delErr } = await adminSupabase
+      .from('datsan_khunggio')
+      .delete()
+      .eq('madatsan', bookingId)
+      .in('makhunggio', normalizedSlotIds);
+
+    if (delErr) {
+      await client.query('ROLLBACK');
+      return { success: false, status: 500, message: 'Lỗi giải phóng khung giờ bị hủy: ' + delErr.message };
+    }
+
+    // Nếu đã thanh toán trực tuyến và có số tiền hoàn: tạo bản ghi hoantien
+    let refundRecord = null;
+    if (isOnlinePaid && refundAmount > 0) {
+      const ownerId = booking.san?.machusan;
+      const deadline = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const { bankName, bankAccount, accountHolder } = refundAccountInfo || {};
+
+      const partialKey = `CANCEL_PARTIAL_${bookingId}_${normalizedSlotIds.slice().sort((a,b)=>a-b).join('_')}`;
+
+      const rfRes = await client.query(`
+        INSERT INTO hoantien 
+        (madatsan, makhachhang, machusan, sotien_canhoan, sotien_dahoan, lydo_huy, trangthai, nganhang_nhan, sotaikhoan_nhan, chutaikhoan_nhan, han_xuly, idempotency_key, slot_ids)
+        VALUES ($1, $2, $3, $4, 0.00, $5, 'CHO_HOAN', $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING *, mahoantien AS id, sotien_canhoan AS sotien_hoan, chutaikhoan_nhan AS tentaikhoan_nhan
+      `, [
+        bookingId,
+        customerId,
+        ownerId,
+        refundAmount,
+        reason || `Khách hàng hủy một phần ${normalizedSlotIds.length} khung giờ`,
+        bankName || 'Vietcombank',
+        bankAccount || '0000000000',
+        accountHolder || 'KHACH HANG',
+        deadline,
+        partialKey,
+        normalizedSlotIds
+      ]);
+
+      refundRecord = rfRes.rows[0];
+      if (!refundRecord) {
+        const existing = await client.query(
+          'SELECT *, mahoantien AS id, sotien_canhoan AS sotien_hoan, chutaikhoan_nhan AS tentaikhoan_nhan FROM hoantien WHERE idempotency_key = $1',
+          [partialKey]
+        );
+        refundRecord = existing.rows[0] || null;
+      }
+
+      if (ownerId) {
+        await adminSupabase.from('thongbao').insert({
+          manguoidung: ownerId,
+          tieude: '💸 Yêu cầu hoàn tiền hủy một phần ca đặt sân',
+          noidung: `Khách hàng vừa hủy ${normalizedSlotIds.length} khung giờ của đơn #${bookingId} trước 4 giờ. Số tiền hoàn lại: ${refundAmount.toLocaleString('vi-VN')}đ. Vui lòng chuyển hoàn trong vòng 24h.`,
+          loaithongbao: 'REFUND_REQUEST'
+        });
+      }
+    }
+
+    // Audit log
+    await logFinancialAudit(client, {
+      actorId: customerId,
+      actorRole: 'KHACHHANG',
+      action: 'MOCK_PAYMENT_PARTIAL_CANCEL',
+      entityType: 'DAT_SAN',
+      entityId: bookingId,
+      oldValues: { tongtien: currentTotal, slotCount: currentActiveSlotIds.length },
+      newValues: { tongtien: newTotal, remainingSlotCount: currentActiveSlotIds.length - normalizedSlotIds.length, refundAmount, cancelledSlotIds: normalizedSlotIds },
+      reason: reason || 'Khách hàng hủy một phần khung giờ',
+      ipAddress: '127.0.0.1'
+    });
+
+    await client.query('COMMIT');
+
+    // Thông báo cho khách hàng
+    await adminSupabase.from('thongbao').insert({
+      manguoidung: customerId,
+      tieude: '✅ Điều chỉnh khung giờ thành công',
+      noidung: isOnlinePaid
+        ? `Đã hủy thành công ${normalizedSlotIds.length} khung giờ của đơn #${bookingId}. Số tiền ${refundAmount.toLocaleString('vi-VN')}đ sẽ được Chủ sân hoàn trả trong 24h.`
+        : `Đã hủy thành công ${normalizedSlotIds.length} khung giờ của đơn #${bookingId}. Số tiền thanh toán tại sân đã giảm xuống còn ${newTotal.toLocaleString('vi-VN')}đ.`,
+      loaithongbao: 'BOOKING_UPDATED'
+    });
+
+    return {
+      success: true,
+      bookingId,
+      cancelledSlotIds: normalizedSlotIds,
+      remainingSlotCount: currentActiveSlotIds.length - normalizedSlotIds.length,
+      refundAmount,
+      newTotal,
+      isOnlinePaid,
+      refundRecord,
+      message: `Đã hủy thành công ${normalizedSlotIds.length} khung giờ. ${isOnlinePaid ? `Số tiền hoàn: ${refundAmount.toLocaleString('vi-VN')}đ` : `Tổng tiền thanh toán mới: ${newTotal.toLocaleString('vi-VN')}đ`}`
     };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -2245,6 +2583,34 @@ async function processMockPayment({
         };
       } else if (simulationAction === 'SIMULATE_FAILURE') {
         if (fallbackAction === 'SWITCH_CASH') {
+          // TASK 03: Kiểm tra giới hạn 120 phút cho hình thức thanh toán tiền mặt
+          let slotRows = [];
+          if (sb) {
+            const { data: dskg } = await sb
+              .from('datsan_khunggio')
+              .select('makhunggio, khunggio:makhunggio(giobatdau, gioketthuc)')
+              .eq('madatsan', transactionId);
+            slotRows = (dskg || []).map(r => r.khunggio).filter(Boolean);
+          } else {
+            const kgRes = await client.query(`
+              SELECT kg.giobatdau, kg.gioketthuc
+              FROM datsan_khunggio dk
+              JOIN khunggio kg ON dk.makhunggio = kg.makhunggio
+              WHERE dk.madatsan = $1
+            `, [transactionId]);
+            slotRows = kgRes.rows;
+          }
+
+          const durationMinutes = calculateDurationMinutesFromSlots(slotRows);
+          if (durationMinutes > 120) {
+            await client.query('ROLLBACK');
+            return {
+              success: false,
+              code: 'ERR_CASH_DURATION_LIMIT',
+              message: `Thanh toán tiền mặt chỉ áp dụng cho đơn đặt sân tối đa 2 giờ (120 phút). Đơn hiện tại có thời lượng ${durationMinutes} phút. Vui lòng thử thanh toán lại trực tuyến hoặc hủy đơn.`
+            };
+          }
+
           // Khách hàng chọn chuyển sang thanh toán tiền mặt tại sân để không làm mất đặt sân
           meta.paymentMethod = 'TIEN_MAT';
           meta.paidAmount = 0;
@@ -2475,6 +2841,8 @@ module.exports = {
   adminSettleDepositRefund,
   checkCancellationEligibility,
   processCustomerCancellation,
+  processPartialCustomerCancellation,
+  calculateDurationMinutesFromSlots,
   ownerConfirmRefundTransferred,
   customerConfirmOrDisputeRefund,
   markOverdueRefunds,
