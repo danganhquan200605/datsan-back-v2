@@ -950,6 +950,7 @@ app.post('/api/fields/register', async (req, res) => {
 // HÀM TỰ ĐỘNG DUYỆT HOÀN TẤT KHI QUÁ GIỜ ĐẶT 1 TIẾNG (AUTO-COMPLETE)
 // TASK 02 (P0): Chỉ hoàn thành đơn sau khi khung giờ cuối cùng kết thúc, không đoán giờ, có khóa lạc quan.
 async function autoCompleteExpiredBookings() {
+  if (process.env.MAINTENANCE_MODE === 'true') return 0;
   if (!adminSupabase) return 0;
   try {
     const { data: bookings } = await adminSupabase
@@ -1058,6 +1059,7 @@ async function autoCompleteExpiredBookings() {
 
 // HÀM TỰ ĐỘNG GỬI THÔNG BÁO NHẮC NỢ KHI QUÁ HẠN 1 TUẦN (7 NGÀY)
 async function autoSendOverdueDebtReminders() {
+  if (process.env.MAINTENANCE_MODE === 'true') return 0;
   if (!adminSupabase) return 0;
   try {
     const { data: bookings, error } = await adminSupabase

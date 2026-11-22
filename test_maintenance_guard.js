@@ -1,8 +1,9 @@
 // test_maintenance_guard.js
-// Automated verification suite for Minimal Production Maintenance Guard
+// Automated verification suite for Minimal Production Maintenance Guard with strict assertions
 
 const { spawn } = require('child_process');
 const http = require('http');
+const assert = require('assert');
 
 const TEST_PORT = 5098;
 
@@ -49,6 +50,7 @@ function startServer(maintenanceMode = 'false') {
         resolve(proc);
       }
     });
+    proc.stderr.on('data', () => {});
     proc.on('error', reject);
     proc.on('exit', (code) => {
       if (!started) reject(new Error('Server exited with code ' + code));
@@ -58,105 +60,150 @@ function startServer(maintenanceMode = 'false') {
 
 async function runTests() {
   console.log('========================================================================');
-  console.log('DATSANONLINE — MINIMAL MAINTENANCE GUARD VERIFICATION SUITE');
+  console.log('DATSANONLINE — STRICT MINIMAL MAINTENANCE GUARD TEST SUITE');
   console.log('========================================================================\n');
 
+  // -------------------------------------------------------------------------
+  // STAGE 1: MAINTENANCE_MODE = false (NORMAL OPERATION)
+  // -------------------------------------------------------------------------
   console.log('--- 1. NORMAL OPERATION (MAINTENANCE_MODE=false) ---');
-  const serverOff = await startServer('false');
+  let server = await startServer('false');
 
   try {
     const health = await makeRequest('/api/health');
-    console.log('  ✅ PASS: GET /api/health returned 200 (Got:', health.status, ')');
-    if (health.status !== 200) throw new Error('Health probe failed');
+    assert.strictEqual(health.status, 200, 'GET /api/health must return 200');
+    assert.strictEqual(health.json?.status, 'ok', 'Health status must be ok');
+    console.log('  ✅ ASSERT PASS: GET /api/health returned 200 { status: "ok" }');
 
     const config = await makeRequest('/api/mock-payment/config');
-    console.log('  ✅ PASS: GET /api/mock-payment/config returned 200 (Got:', config.status, ')');
+    assert.strictEqual(config.status, 200, 'GET /api/mock-payment/config must return 200');
+    assert.strictEqual(config.json?.financialMode, 'DEMO', 'financialMode must be DEMO');
+    console.log('  ✅ ASSERT PASS: GET /api/mock-payment/config returned 200 { financialMode: "DEMO" }');
 
     const booking = await makeRequest('/api/bookings', 'POST', { masan: 1 });
-    console.log('  ✅ PASS: POST /api/bookings passed guard to auth/handler (Got:', booking.status, ')');
-    if (booking.status === 503) throw new Error('Maintenance guard blocked when false!');
+    assert.notStrictEqual(booking.status, 503, 'POST /api/bookings must not be blocked by 503 when maintenance=false');
+    assert.strictEqual(booking.status, 401, 'POST /api/bookings must reach auth layer (401 without token)');
+    console.log('  ✅ ASSERT PASS: POST /api/bookings passed guard to auth layer (HTTP 401)');
 
     const cancel = await makeRequest('/api/customer/cancel-booking', 'POST', { bookingId: 1 });
-    console.log('  ✅ PASS: POST /api/customer/cancel-booking passed guard (Got:', cancel.status, ')');
+    assert.notStrictEqual(cancel.status, 503, 'POST /api/customer/cancel-booking must not be 503');
+    assert.strictEqual(cancel.status, 401, 'POST /api/customer/cancel-booking must reach auth layer (HTTP 401)');
+    console.log('  ✅ ASSERT PASS: POST /api/customer/cancel-booking passed guard (HTTP 401)');
 
     const payment = await makeRequest('/api/mock-payment/process', 'POST', {});
-    console.log('  ✅ PASS: POST /api/mock-payment/process passed guard (Got:', payment.status, ')');
+    assert.notStrictEqual(payment.status, 503, 'POST /api/mock-payment/process must not be 503');
+    assert.strictEqual(payment.status, 401, 'POST /api/mock-payment/process must reach auth layer (HTTP 401)');
+    console.log('  ✅ ASSERT PASS: POST /api/mock-payment/process passed guard (HTTP 401)');
   } finally {
-    serverOff.kill();
+    server.kill();
     await new Promise(r => setTimeout(r, 1000));
   }
 
+  // -------------------------------------------------------------------------
+  // STAGE 2: MAINTENANCE_MODE = true (ACTIVE MAINTENANCE GUARD)
+  // -------------------------------------------------------------------------
   console.log('\n--- 2. ACTIVE MAINTENANCE MODE (MAINTENANCE_MODE=true) ---');
-  const serverOn = await startServer('true');
+  server = await startServer('true');
 
   try {
+    // 1. Health Probe
     const health = await makeRequest('/api/health');
-    console.log('  ✅ PASS: GET /api/health remains accessible (Got:', health.status, ')');
-    if (health.status !== 200) throw new Error('Health probe blocked during maintenance');
+    assert.strictEqual(health.status, 200, 'GET /api/health must remain 200 during maintenance');
+    console.log('  ✅ ASSERT PASS: GET /api/health remains accessible (HTTP 200)');
 
+    // 2. Mock Payment Config
     const config = await makeRequest('/api/mock-payment/config');
-    console.log('  ✅ PASS: GET /api/mock-payment/config remains accessible (Got:', config.status, ')');
-    if (config.status !== 200) throw new Error('Config probe blocked during maintenance');
+    assert.strictEqual(config.status, 200, 'GET /api/mock-payment/config must remain 200');
+    console.log('  ✅ ASSERT PASS: GET /api/mock-payment/config remains accessible (HTTP 200)');
 
+    // 3. Mutating GET /api/owner/deposit
     const depositGet = await makeRequest('/api/owner/deposit');
-    console.log('  ✅ PASS: Mutating GET /api/owner/deposit blocked with 503 ERR_MAINTENANCE_MODE');
-    if (depositGet.status !== 503 || depositGet.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Mutating GET not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(depositGet.status, 503, 'Mutating GET /api/owner/deposit must return 503');
+    assert.strictEqual(depositGet.json?.code, 'ERR_MAINTENANCE_MODE', 'Code must be ERR_MAINTENANCE_MODE');
+    assert.strictEqual(depositGet.json?.maintenance, true, 'maintenance must be true');
+    console.log('  ✅ ASSERT PASS: Mutating GET /api/owner/deposit strictly blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 4. Booking Write
     const booking = await makeRequest('/api/bookings', 'POST', { masan: 1 });
-    console.log('  ✅ PASS: POST /api/bookings blocked with 503 ERR_MAINTENANCE_MODE');
-    if (booking.status !== 503 || booking.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Booking write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(booking.status, 503, 'POST /api/bookings must return 503');
+    assert.strictEqual(booking.json?.code, 'ERR_MAINTENANCE_MODE');
+    assert.strictEqual(booking.json?.maintenance, true);
+    console.log('  ✅ ASSERT PASS: POST /api/bookings blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 5. Cancellation Write
     const cancel = await makeRequest('/api/customer/cancel-booking', 'POST', { bookingId: 1 });
-    console.log('  ✅ PASS: POST /api/customer/cancel-booking blocked with 503 ERR_MAINTENANCE_MODE');
-    if (cancel.status !== 503 || cancel.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Cancellation write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(cancel.status, 503, 'POST /api/customer/cancel-booking must return 503');
+    assert.strictEqual(cancel.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/customer/cancel-booking blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 6. Payment Write
     const payment = await makeRequest('/api/mock-payment/process', 'POST', {});
-    console.log('  ✅ PASS: POST /api/mock-payment/process blocked with 503 ERR_MAINTENANCE_MODE');
-    if (payment.status !== 503 || payment.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Payment write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(payment.status, 503, 'POST /api/mock-payment/process must return 503');
+    assert.strictEqual(payment.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/mock-payment/process blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 7. Owner Settle Write
     const settle = await makeRequest('/api/owner/settle-booking', 'POST', {});
-    console.log('  ✅ PASS: POST /api/owner/settle-booking blocked with 503 ERR_MAINTENANCE_MODE');
-    if (settle.status !== 503 || settle.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Owner settle write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(settle.status, 503, 'POST /api/owner/settle-booking must return 503');
+    assert.strictEqual(settle.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/owner/settle-booking blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 8. Admin Verify Deposit Write
     const verifyDeposit = await makeRequest('/api/admin/deposits/verify', 'POST', {});
-    console.log('  ✅ PASS: POST /api/admin/deposits/verify blocked with 503 ERR_MAINTENANCE_MODE');
-    if (verifyDeposit.status !== 503 || verifyDeposit.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Admin verify deposit write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(verifyDeposit.status, 503, 'POST /api/admin/deposits/verify must return 503');
+    assert.strictEqual(verifyDeposit.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/admin/deposits/verify blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
+    // 9. Generic Frontend Write (/api/data)
     const apiData = await makeRequest('/api/data', 'POST', { table: 'datsan', action: 'insert' });
-    console.log('  ✅ PASS: Generic frontend POST /api/data blocked with 503 ERR_MAINTENANCE_MODE');
-    if (apiData.status !== 503 || apiData.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Generic frontend POST /api/data write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    assert.strictEqual(apiData.status, 503, 'POST /api/data must return 503');
+    assert.strictEqual(apiData.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: Generic frontend POST /api/data blocked with HTTP 503 ERR_MAINTENANCE_MODE');
 
-    const authWrite = await makeRequest('/api/bookings', 'POST', { masan: 1 }, { Authorization: 'Bearer mock_valid_jwt' });
-    console.log('  ✅ PASS: Authenticated write attempt with Bearer token blocked with 503 ERR_MAINTENANCE_MODE');
-    if (authWrite.status !== 503 || authWrite.json?.code !== 'ERR_MAINTENANCE_MODE') {
-      throw new Error('Authenticated write not intercepted with 503 ERR_MAINTENANCE_MODE');
-    }
+    // 10. Authenticated Write with Bearer Token
+    const authWrite = await makeRequest('/api/bookings', 'POST', { masan: 1 }, { Authorization: 'Bearer mock_jwt_token' });
+    assert.strictEqual(authWrite.status, 503, 'Authenticated write must return 503');
+    assert.strictEqual(authWrite.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: Authenticated request blocked with HTTP 503 ERR_MAINTENANCE_MODE (Auth preserved)');
 
-    console.log('\n========================================================================');
-    console.log('ALL 15 GUARD SUITE CHECKS PASSED WITH 100% SUCCESS!');
-    console.log('========================================================================');
+    // 11. Auth OTP endpoints blocked during maintenance
+    const authOtp = await makeRequest('/api/auth/otp', 'POST', { phone: '+84912345678' });
+    assert.strictEqual(authOtp.status, 503, 'POST /api/auth/otp must return 503');
+    assert.strictEqual(authOtp.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/auth/otp blocked with HTTP 503 ERR_MAINTENANCE_MODE');
+
+    const authVerify = await makeRequest('/api/auth/verify', 'POST', { phone: '+84912345678', token: '123456' });
+    assert.strictEqual(authVerify.status, 503, 'POST /api/auth/verify must return 503');
+    assert.strictEqual(authVerify.json?.code, 'ERR_MAINTENANCE_MODE');
+    console.log('  ✅ ASSERT PASS: POST /api/auth/verify (OTP 123456) blocked with HTTP 503 ERR_MAINTENANCE_MODE');
   } finally {
-    serverOn.kill();
+    server.kill();
+    await new Promise(r => setTimeout(r, 1000));
   }
+
+  // -------------------------------------------------------------------------
+  // STAGE 3: RESTORATION VERIFICATION (MAINTENANCE_MODE TOGGLED BACK TO FALSE)
+  // -------------------------------------------------------------------------
+  console.log('\n--- 3. RESTORATION VERIFICATION (MAINTENANCE_MODE=false) ---');
+  server = await startServer('false');
+
+  try {
+    const postReopen = await makeRequest('/api/bookings', 'POST', { masan: 1 });
+    assert.strictEqual(postReopen.status, 401, 'POST /api/bookings must immediately resume normal handling (401)');
+    assert.notStrictEqual(postReopen.status, 503, 'Must not be 503 after reopening');
+    console.log('  ✅ ASSERT PASS: Normal service restored immediately when MAINTENANCE_MODE=false');
+  } finally {
+    server.kill();
+  }
+
+  console.log('\n========================================================================');
+  console.log('ALL STRICT ASSERTION CHECKS PASSED WITH 100% SUCCESS!');
+  console.log('========================================================================');
 }
 
 if (require.main === module) {
   runTests().catch(err => {
-    console.error('TEST SUITE FAILED:', err);
+    console.error('TEST ASSERTION FAILED:', err);
     process.exit(1);
   });
 }
