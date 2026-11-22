@@ -759,7 +759,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     let booking = null;
     try {
       const bRes = await client.query(`
-        SELECT d.*, s.tensan, s.machusan, s.giasan, s.giacoban
+        SELECT d.*, s.tensan, s.machusan, s.giasan
         FROM datsan d
         LEFT JOIN san s ON d.masan = s.masan
         WHERE d.madatsan = $1
@@ -773,7 +773,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
           san: {
             tensan: row.tensan,
             machusan: row.machusan,
-            giasan: row.giasan || row.giacoban
+            giasan: row.giasan
           }
         };
       }
@@ -782,7 +782,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     if (!booking && adminSupabase) {
       const { data: sbBooking } = await adminSupabase
         .from('datsan')
-        .select('*, san (tensan, machusan, giasan, giacoban)')
+        .select('*, san (tensan, machusan, giasan)')
         .eq('madatsan', bookingId)
         .single();
       booking = sbBooking;
@@ -1061,7 +1061,7 @@ async function processPartialCustomerCancellation({
     let booking = null;
     try {
       const bRes = await client.query(`
-        SELECT d.*, s.tensan, s.machusan, s.giasan, s.giacoban
+        SELECT d.*, s.tensan, s.machusan, s.giasan
         FROM datsan d
         LEFT JOIN san s ON d.masan = s.masan
         WHERE d.madatsan = $1
@@ -1075,7 +1075,7 @@ async function processPartialCustomerCancellation({
           san: {
             tensan: row.tensan,
             machusan: row.machusan,
-            giasan: row.giasan || row.giacoban
+            giasan: row.giasan
           }
         };
       }
@@ -1084,7 +1084,7 @@ async function processPartialCustomerCancellation({
     if (!booking && adminSupabase) {
       const { data: sbBooking } = await adminSupabase
         .from('datsan')
-        .select('*, san (tensan, machusan, giasan, giacoban)')
+        .select('*, san (tensan, machusan, giasan)')
         .eq('madatsan', bookingId)
         .single();
       booking = sbBooking;
