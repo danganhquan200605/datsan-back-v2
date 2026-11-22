@@ -469,10 +469,14 @@ app.get('/api/owner/overview', async (req, res) => {
           .from('danhgia')
           .select('sosao')
           .in('madatsan', bookingIds);
-        if (reviewErr) throw reviewErr;
-        const scores = (reviews || []).map(r => Number(r.sosao)).filter(n => Number.isFinite(n) && n >= 1 && n <= 5);
-        if (scores.length > 0) {
-          ratingSummary = { count: scores.length, average: scores.reduce((sum, n) => sum + n, 0) / scores.length };
+        if (reviewErr) {
+          console.warn('Unable to calculate owner rating:', reviewErr.message);
+          ratingSummary = { count: 0, average: null, unavailable: true };
+        } else {
+          const scores = (reviews || []).map(r => Number(r.sosao)).filter(n => Number.isFinite(n) && n >= 1 && n <= 5);
+          if (scores.length > 0) {
+            ratingSummary = { count: scores.length, average: scores.reduce((sum, n) => sum + n, 0) / scores.length };
+          }
         }
       }
     }
