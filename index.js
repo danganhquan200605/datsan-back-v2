@@ -412,8 +412,8 @@ app.get('/api/owner/overview', async (req, res) => {
   if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const authData = await getAuthenticatedProfile(req);
   if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
-  if (authData.role !== 'CHUSAN' && authData.role !== 'ADMIN') {
-    return res.status(403).json({ error: 'Forbidden: Field Owner or Admin privileges required' });
+  if (authData.role !== 'CHUSAN') {
+    return res.status(403).json({ error: 'Forbidden: Field Owner privileges required' });
   }
 
   const ownerId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
@@ -439,6 +439,7 @@ app.get('/api/owner/overview', async (req, res) => {
     const sanIds = (mySanData || []).map(s => s.masan);
 
     let bookingsData = [];
+    let ratingSummary = { count: 0, average: null };
     if (sanIds.length > 0) {
       const { data: bData, error: bookingErr } = await adminSupabase
         .from('datsan')
@@ -460,13 +461,28 @@ app.get('/api/owner/overview', async (req, res) => {
 
       if (bookingErr) throw bookingErr;
       bookingsData = bData || [];
+
+      // Only aggregate verified reviews for bookings belonging to this owner's courts.
+      const bookingIds = [...new Set(bookingsData.map(b => Number(b.madatsan)).filter(Number.isInteger))];
+      if (bookingIds.length > 0) {
+        const { data: reviews, error: reviewErr } = await adminSupabase
+          .from('danhgia')
+          .select('sosao')
+          .in('madatsan', bookingIds);
+        if (reviewErr) throw reviewErr;
+        const scores = (reviews || []).map(r => Number(r.sosao)).filter(n => Number.isFinite(n) && n >= 1 && n <= 5);
+        if (scores.length > 0) {
+          ratingSummary = { count: scores.length, average: scores.reduce((sum, n) => sum + n, 0) / scores.length };
+        }
+      }
     }
 
     return res.json({
       success: true,
       data: {
         fields: mySanData || [],
-        bookings: bookingsData
+        bookings: bookingsData,
+        ratingSummary
       }
     });
   } catch (err) {
