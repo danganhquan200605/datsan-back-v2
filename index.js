@@ -539,21 +539,19 @@ app.get('/api/owner/overview', async (req, res) => {
   }
 
   try {
-    // 1. Danh sách sân thuộc sở hữu của chủ sân này
-    const { data: mySanData, error: sanErr } = await adminSupabase
+    // 1. Danh sách sân thuộc sở hữu của chủ sân này (dùng select * để tránh lỗi quan hệ vitri)
+    const { data: rawSanData, error: sanErr } = await adminSupabase
       .from('san')
-      .select(`
-        masan,
-        tensan,
-        giasan,
-        hinhanh,
-        trangthai,
-        vitri (diachi, quan)
-      `)
+      .select('*')
       .eq('machusan', ownerId);
 
     if (sanErr) throw sanErr;
-    const sanIds = (mySanData || []).map(s => s.masan);
+    const mySanData = (rawSanData || []).map(s => ({
+      ...s,
+      giasan: s.giacoban || s.giasan || 0,
+      vitri: s.vitri || { diachi: s.diachi || '', quan: '' }
+    }));
+    const sanIds = mySanData.map(s => s.masan);
 
     let bookingsData = [];
     let ratingSummary = { count: 0, average: null };
@@ -567,8 +565,8 @@ app.get('/api/owner/overview', async (req, res) => {
           tongtien,
           trangthai,
           ghichu,
-          san (tensan),
-          nguoidung:makhachhang (hoten, sodienthoai),
+          masan,
+          makhachhang,
           datsan_khunggio (
             khunggio (giobatdau, gioketthuc)
           )
@@ -577,7 +575,28 @@ app.get('/api/owner/overview', async (req, res) => {
         .order('ngaydat', { ascending: false });
 
       if (bookingErr) throw bookingErr;
-      bookingsData = bData || [];
+
+      // Tra cứu thông tin khách hàng độc lập để không phụ thuộc quan hệ foreign key PostgREST
+      const customerIds = [...new Set((bData || []).map(b => b.makhachhang).filter(Boolean))];
+      let customerMap = {};
+      if (customerIds.length > 0) {
+        const { data: customers } = await adminSupabase
+          .from('nguoidung')
+          .select('manguoidung, hoten, sodienthoai')
+          .in('manguoidung', customerIds);
+        (customers || []).forEach(c => {
+          customerMap[c.manguoidung] = c;
+        });
+      }
+
+      const sanMap = {};
+      mySanData.forEach(s => { sanMap[s.masan] = s.tensan; });
+
+      bookingsData = (bData || []).map(b => ({
+        ...b,
+        san: { tensan: sanMap[b.masan] || 'Sân thể thao' },
+        nguoidung: customerMap[b.makhachhang] || { hoten: 'Khách hàng', sodienthoai: '' }
+      }));
 
       // Only aggregate verified reviews for bookings belonging to this owner's courts.
       const bookingIds = [...new Set(bookingsData.map(b => Number(b.madatsan)).filter(Number.isInteger))];
@@ -1402,19 +1421,57 @@ async function getAuthenticatedProfile(req) {
     // Fallback if RPC is not present
   }
 
-  // Fallback: lookup via adminSupabase or supabase by auth_user_id
+  // Fallback: lookup via adminSupabase or supabase by auth_user_id, phone, or email
   try {
     const client = adminSupabase || supabase;
     const userId = authClient.authUser?.id;
     if (!userId) return null;
 
-    const { data: profile, error } = await client
+    let { data: profile } = await client
       .from('nguoidung')
       .select('*')
       .eq('auth_user_id', userId)
-      .single();
+      .maybeSingle();
 
-    if (error || !profile) return null;
+    if (!profile) {
+      const userPhone = authClient.authUser?.phone || '';
+      const userEmail = authClient.authUser?.email || '';
+      const cleanPhone = (userPhone || userEmail || '').replace(/^\+/, '').replace(/@.*$/, '');
+      const localPhone = cleanPhone.startsWith('84') ? '0' + cleanPhone.slice(2) : cleanPhone;
+
+      const orConditions = [];
+      if (localPhone && /^\d+$/.test(localPhone)) {
+        orConditions.push(`sodienthoai.eq.${localPhone}`);
+        orConditions.push(`sodienthoai.eq.0${localPhone.replace(/^0+/, '')}`);
+        orConditions.push(`sodienthoai.eq.+84${localPhone.replace(/^0+/, '')}`);
+      }
+      if (userEmail) {
+        orConditions.push(`email.eq.${userEmail}`);
+      }
+
+      if (orConditions.length > 0) {
+        const { data: matchedProfile } = await client
+          .from('nguoidung')
+          .select('*')
+          .or(orConditions.join(','))
+          .order('manguoidung', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (matchedProfile) {
+          profile = matchedProfile;
+          // Đồng bộ auth_user_id vào hồ sơ nguoidung
+          if (matchedProfile.auth_user_id !== userId && adminSupabase) {
+            await adminSupabase
+              .from('nguoidung')
+              .update({ auth_user_id: userId })
+              .eq('manguoidung', matchedProfile.manguoidung);
+          }
+        }
+      }
+    }
+
+    if (!profile) return null;
     return {
       authClient,
       profile,
