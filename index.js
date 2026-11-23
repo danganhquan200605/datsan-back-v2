@@ -142,27 +142,58 @@ app.post('/api/auth/verify', async (req, res) => {
     } else if (token === '123456') {
       // 2. Cơ chế OTP mặc định 123456 cho toàn bộ các tài khoản trong hệ thống
       const fixedPassword = 'DatSanPassword@2026';
+      let authEmail = null;
       if (adminSupabase) {
         const cleanPhone = phone.replace(/^\+/, '');
         const { data: userList } = await adminSupabase.auth.admin.listUsers();
-        const existingUser = userList?.users?.find(u => u.phone === cleanPhone || u.phone === phone);
+        let existingUser = userList?.users?.find(u => u.phone === cleanPhone || u.phone === phone || u.email?.includes(cleanPhone));
         if (!existingUser) {
-          await adminSupabase.auth.admin.createUser({
+          const { data: created } = await adminSupabase.auth.admin.createUser({
             phone: phone,
+            email: `${cleanPhone}@datsan.demo`,
+            email_confirm: true,
             phone_confirm: true,
             password: fixedPassword,
           });
+          if (created?.user) {
+            existingUser = created.user;
+            authEmail = existingUser.email;
+          }
         } else {
-          await adminSupabase.auth.admin.updateUserById(existingUser.id, {
-            password: fixedPassword,
-            phone_confirm: true,
-          });
+          authEmail = existingUser.email;
+          if (!authEmail) {
+            authEmail = `${cleanPhone}@datsan.demo`;
+            await adminSupabase.auth.admin.updateUserById(existingUser.id, {
+              email: authEmail,
+              email_confirm: true,
+              password: fixedPassword,
+              phone_confirm: true,
+            });
+          } else {
+            await adminSupabase.auth.admin.updateUserById(existingUser.id, {
+              password: fixedPassword,
+              email_confirm: true,
+              phone_confirm: true,
+            });
+          }
         }
       }
-      const { data: signData, error: signError } = await supabase.auth.signInWithPassword({
+      let { data: signData, error: signError } = await supabase.auth.signInWithPassword({
         phone: phone,
         password: fixedPassword,
       });
+      if (signError && (signError.code === 'phone_provider_disabled' || signError.status === 422)) {
+        const cleanPhone = phone.replace(/^\+/, '');
+        const emailToTry = authEmail || `${cleanPhone}@datsan.demo`;
+        const emailSign = await supabase.auth.signInWithPassword({
+          email: emailToTry,
+          password: fixedPassword,
+        });
+        if (emailSign?.data?.session) {
+          signData = emailSign.data;
+          signError = null;
+        }
+      }
       if (signError || !signData?.session) {
         const failResult = handleVerifyFailure(phone, signError?.message);
         return res.status(failResult.status).json({
@@ -190,8 +221,45 @@ app.post('/api/auth/verify', async (req, res) => {
       global: { headers: { Authorization: `Bearer ${session.access_token}` } },
       auth: { persistSession: false, autoRefreshToken: false },
     });
-    const { data: profile, error: profileError } = await userClient.rpc('ensure_current_nguoidung');
-    if (profileError) return res.status(403).json({ error: profileError.message });
+    let profile = null;
+    const { data: rpcProfile, error: profileError } = await userClient.rpc('ensure_current_nguoidung');
+    if (!profileError && rpcProfile) {
+      profile = rpcProfile;
+    } else {
+      // Resilient fallback: direct query in nguoidung by auth_user_id or phone
+      const cleanPhone = phone.replace(/^\+/, '');
+      const localPhone = cleanPhone.startsWith('84') ? '0' + cleanPhone.slice(2) : cleanPhone;
+      const dbClient = adminSupabase || userClient;
+      const { data: directProfile } = await dbClient
+        .from('nguoidung')
+        .select('*')
+        .or(`auth_user_id.eq.${session.user.id},sodienthoai.eq.${localPhone},sodienthoai.eq.${phone},sodienthoai.eq.${cleanPhone}`)
+        .order('manguoidung', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (directProfile) {
+        profile = directProfile;
+        if (!directProfile.auth_user_id && adminSupabase) {
+          await adminSupabase.from('nguoidung').update({ auth_user_id: session.user.id }).eq('manguoidung', directProfile.manguoidung);
+        }
+      } else {
+        // If neither RPC nor direct lookup found the profile, create a default customer profile
+        const { data: newProfile } = await (adminSupabase || dbClient)
+          .from('nguoidung')
+          .insert({
+            auth_user_id: session.user.id,
+            sodienthoai: localPhone,
+            hoten: `Người dùng ${localPhone}`,
+            vaitro: 'KHACHHANG',
+            trangthai: 'HOATDONG',
+          })
+          .select()
+          .single();
+        profile = newProfile;
+      }
+    }
+    if (!profile) return res.status(403).json({ error: profileError?.message || 'Không tìm thấy hồ sơ người dùng' });
     return res.json({
       accessToken: session.access_token,
       refreshToken: session.refresh_token,
