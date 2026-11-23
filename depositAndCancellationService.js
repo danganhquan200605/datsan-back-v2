@@ -797,7 +797,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     let booking = null;
     try {
       const bRes = await client.query(`
-        SELECT d.*, s.tensan, s.machusan, s.giasan
+        SELECT d.*, s.tensan, s.machusan
         FROM datsan d
         LEFT JOIN san s ON d.masan = s.masan
         WHERE d.madatsan = $1
@@ -810,8 +810,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
           makhachhang: row.makhachhang || row.manguoidung,
           san: {
             tensan: row.tensan,
-            machusan: row.machusan,
-            giasan: row.giasan
+            machusan: row.machusan
           }
         };
       }
@@ -820,7 +819,7 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     if (!booking && adminSupabase) {
       const { data: sbBooking } = await adminSupabase
         .from('datsan')
-        .select('*, san (tensan, machusan, giasan)')
+        .select('*, san (tensan, machusan)')
         .eq('madatsan', bookingId)
         .single();
       booking = sbBooking;
@@ -927,14 +926,35 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
       RETURNING *
     `, [JSON.stringify(meta), bookingId, booking.trangthai]);
 
-    if (updRes.rowCount === 0 && !adminSupabase?.state) {
-      await client.query('ROLLBACK');
-      return {
-        success: false,
-        status: 409,
-        code: 'CONCURRENT_CONFLICT',
-        message: 'Xung đột thao tác: Đơn đặt sân đã được hủy bởi một yêu cầu khác.'
-      };
+    if (updRes.rowCount === 0) {
+      if (adminSupabase && !adminSupabase.state) {
+        const { data: sbUpd, error: sbUpdErr } = await adminSupabase
+          .from('datsan')
+          .update({ trangthai: 'DA_HUY', ghichu: JSON.stringify(meta) })
+          .eq('madatsan', bookingId)
+          .eq('trangthai', booking.trangthai)
+          .select()
+          .single();
+        if (sbUpdErr || !sbUpd) {
+          await client.query('ROLLBACK');
+          return {
+            success: false,
+            status: 409,
+            code: 'CONCURRENT_CONFLICT',
+            message: 'Xung đột thao tác: Đơn đặt sân đã được hủy bởi một yêu cầu khác.'
+          };
+        }
+        await adminSupabase.from('datsan_khunggio').delete().eq('madatsan', bookingId);
+        await adminSupabase.from('thanhtoan').update({ trangthai: 'DA_HUY' }).eq('madatsan', bookingId);
+      } else if (!adminSupabase?.state) {
+        await client.query('ROLLBACK');
+        return {
+          success: false,
+          status: 409,
+          code: 'CONCURRENT_CONFLICT',
+          message: 'Xung đột thao tác: Đơn đặt sân đã được hủy bởi một yêu cầu khác.'
+        };
+      }
     }
 
     if (_injectFailureStep === 'AFTER_BOOKING_UPDATE') {
@@ -1115,7 +1135,7 @@ async function processPartialCustomerCancellation({
     let booking = null;
     try {
       const bRes = await client.query(`
-        SELECT d.*, s.tensan, s.machusan, s.giasan
+        SELECT d.*, s.tensan, s.machusan
         FROM datsan d
         LEFT JOIN san s ON d.masan = s.masan
         WHERE d.madatsan = $1
@@ -1128,8 +1148,7 @@ async function processPartialCustomerCancellation({
           makhachhang: row.makhachhang || row.manguoidung,
           san: {
             tensan: row.tensan,
-            machusan: row.machusan,
-            giasan: row.giasan
+            machusan: row.machusan
           }
         };
       }
@@ -1138,7 +1157,7 @@ async function processPartialCustomerCancellation({
     if (!booking && adminSupabase) {
       const { data: sbBooking } = await adminSupabase
         .from('datsan')
-        .select('*, san (tensan, machusan, giasan)')
+        .select('*, san (tensan, machusan)')
         .eq('madatsan', bookingId)
         .single();
       booking = sbBooking;
@@ -1322,9 +1341,23 @@ async function processPartialCustomerCancellation({
       RETURNING *
     `, [newTotal, JSON.stringify(meta), bookingId]);
 
-    if (updRes.rowCount === 0 && !adminSupabase?.state) {
-      await client.query('ROLLBACK');
-      return { success: false, status: 500, message: 'Lỗi cập nhật giá trị đơn đặt sân sau khi điều chỉnh khung giờ.' };
+    if (updRes.rowCount === 0) {
+      if (adminSupabase && !adminSupabase.state) {
+        const { data: sbUpd, error: sbUpdErr } = await adminSupabase
+          .from('datsan')
+          .update({ tongtien: newTotal, ghichu: JSON.stringify(meta) })
+          .eq('madatsan', bookingId)
+          .select()
+          .single();
+        if (sbUpdErr || !sbUpd) {
+          await client.query('ROLLBACK');
+          return { success: false, status: 500, message: 'Lỗi cập nhật giá trị đơn đặt sân sau khi điều chỉnh khung giờ.' };
+        }
+        await adminSupabase.from('datsan_khunggio').delete().eq('madatsan', bookingId).in('makhunggio', normalizedSlotIds);
+      } else if (!adminSupabase?.state) {
+        await client.query('ROLLBACK');
+        return { success: false, status: 500, message: 'Lỗi cập nhật giá trị đơn đặt sân sau khi điều chỉnh khung giờ.' };
+      }
     }
 
     if (_injectFailureStep === 'AFTER_BOOKING_UPDATE') {

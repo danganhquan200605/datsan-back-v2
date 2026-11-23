@@ -72,7 +72,7 @@ BEGIN
     RAISE EXCEPTION 'Vui lòng nhập họ tên khách hàng (tối thiểu 2 ký tự).' USING errcode = '22023';
   END IF;
   v_clean_phone := regexp_replace(p_customer_phone, '[\s.-]', '', 'g');
-  IF NOT (v_clean_phone ~ '^(0|\+84)[35789][0-9]{8}$') THEN
+  IF NOT (v_clean_phone ~ '^(0|[+]84)[35789][0-9]{8}$') THEN
     RAISE EXCEPTION 'Số điện thoại khách hàng không đúng định dạng Việt Nam.' USING errcode = '22023';
   END IF;
   v_std_phone := CASE WHEN v_clean_phone LIKE '+84%' THEN '0' || substring(v_clean_phone FROM 4) ELSE v_clean_phone END;
