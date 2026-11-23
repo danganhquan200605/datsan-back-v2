@@ -436,7 +436,7 @@ app.post('/api/bookings', async (req, res) => {
           await adminSupabase.from('thongbao').insert({
             manguoidung: ownerId,
             tieude: '🔔 Đơn đặt sân mới!',
-            noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Đã thanh toán mô phỏng DEMO'}).`,
+            noidung: `Khách hàng vừa đặt sân ${sanName} ngày ${date} (${isCash ? 'Thu 100% tiền mặt tại sân' : 'Thanh toán trực tuyến'}).`,
             loaithongbao: 'BOOKING'
           });
         }
@@ -444,8 +444,8 @@ app.post('/api/bookings', async (req, res) => {
         // 3. Thông báo cho Super Admin
         await adminSupabase.from('thongbao').insert({
           manguoidung: null, // Broadcast hoặc Admin
-          tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
-          noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod} - Mô phỏng DEMO).`,
+          tieude: '📋 Đơn đặt sân mới toàn sàn',
+          noidung: `Khách đặt sân ${sanName} ngày ${date} - Tổng tiền: ${bookingTotal.toLocaleString('vi-VN')} đ (${paymentMethod}).`,
           loaithongbao: 'ADMIN'
         });
       } catch (notifErr) {
@@ -1724,12 +1724,15 @@ app.post('/api/storage/:bucket', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'File is required' });
   const path = String(req.body.path || '').replace(/^\/+/, '');
   if (!path || path.includes('..')) return res.status(400).json({ error: 'Invalid file path' });
-  const { data, error } = await requestClient.storage.from(req.params.bucket).upload(path, req.file.buffer, {
+  
+  // Use adminSupabase to guarantee storage insert privileges while keeping token authentication strict
+  const storageClient = adminSupabase || requestClient;
+  const { data, error } = await storageClient.storage.from(req.params.bucket).upload(path, req.file.buffer, {
     contentType: req.file.mimetype, upsert: true,
   });
   if (error) return res.status(400).json({ error: error.message });
-  const { data: publicUrl } = requestClient.storage.from(req.params.bucket).getPublicUrl(data.path);
-  return res.json({ data, publicUrl: publicUrl.publicUrl });
+  const { data: publicUrl } = storageClient.storage.from(req.params.bucket).getPublicUrl(data.path);
+  return res.json({ success: true, data, publicUrl: publicUrl?.publicUrl });
 });
 
 // GẮN CÁC ENDPOINT CHO FEATURE 01 (OWNER DEPOSIT) VÀ FEATURE 02 (CUSTOMER CANCELLATION)

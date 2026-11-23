@@ -125,12 +125,18 @@ function mountDepositAndCancellationRoutes(app, { adminSupabase, getAuthenticate
     try {
       const result = await service.createDepositPaymentRequest(ownerId);
       if (!result.success) {
-        return res.status(400).json(result);
+        return res.status(400).json({
+          ...result,
+          error: result.message || 'Không thể tạo yêu cầu thanh toán ký quỹ'
+        });
       }
-      return res.json(result);
+      return res.json({
+        ...result,
+        paymentDetails: result.data
+      });
     } catch (err) {
-      console.error('Error creating deposit request:', err);
-      return res.status(500).json({ error: 'Lỗi tạo yêu cầu thanh toán ký quỹ' });
+      console.error('[Deposit Request Error] Owner:', ownerId, err.message);
+      return res.status(500).json({ error: 'Lỗi tạo yêu cầu thanh toán ký quỹ: ' + err.message });
     }
   });
 

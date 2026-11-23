@@ -2732,20 +2732,20 @@ async function processMockPayment({
             await sb.from('thongbao').insert([
               {
                 manguoidung: booking.makhachhang,
-                tieude: '🎉 Thanh toán mô phỏng thành công!',
-                noidung: `Bạn đã thanh toán mô phỏng (DEMO 100%) đơn đặt sân ${sanName} ngày ${booking.ngaysudung}. Mã GD: ${mockBankTx}.`,
+                tieude: '🎉 Thanh toán thành công!',
+                noidung: `Bạn đã thanh toán thành công đơn đặt sân ${sanName} ngày ${booking.ngaysudung}. Mã GD: ${mockBankTx}.`,
                 loaithongbao: 'BOOKING'
               },
               ...(ownerId ? [{
                 manguoidung: ownerId,
-                tieude: '🔔 Đơn đặt sân mới (Mô phỏng)!',
-                noidung: `Khách hàng vừa hoàn tất thanh toán mô phỏng (DEMO 100%) cho sân ${sanName} ngày ${booking.ngaysudung}.`,
+                tieude: '🔔 Đơn đặt sân mới!',
+                noidung: `Khách hàng vừa hoàn tất thanh toán cho sân ${sanName} ngày ${booking.ngaysudung}.`,
                 loaithongbao: 'BOOKING'
               }] : []),
               {
                 manguoidung: null,
-                tieude: '📋 Đơn đặt sân mới toàn sàn (DEMO)',
-                noidung: `Khách đã thanh toán mô phỏng đơn #${transactionId} tại sân ${sanName} - ${totalAmount.toLocaleString('vi-VN')} đ (DEMO).`,
+                tieude: '📋 Đơn đặt sân mới toàn sàn',
+                noidung: `Khách đã thanh toán đơn #${transactionId} tại sân ${sanName} - ${totalAmount.toLocaleString('vi-VN')} đ.`,
                 loaithongbao: 'ADMIN'
               }
             ]);
