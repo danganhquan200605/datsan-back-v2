@@ -417,7 +417,7 @@ async function checkCourtDepositEligibility(ownerId, adminSupabase = null) {
         const lockedBalance = Number(dep.sodu_dongbang || 0);
         const availableBalance = Number(dep.sodu_khadung ?? (totalBalance - lockedBalance));
 
-        if (dep.trangthai === 'DA_DUYET' || dep.trangthai === 'HOAT_DONG') {
+        if (dep.trangthai === 'DA_KY_QUY' || dep.trangthai === 'DA_DUYET' || dep.trangthai === 'HOAT_DONG') {
           return { allowed: true, deposit: dep, balance: totalBalance, available: availableBalance };
         }
         if (dep.trangthai === 'CHO_DUYET') {
