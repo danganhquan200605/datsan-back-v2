@@ -404,6 +404,44 @@ async function adminVerifyDepositPayment(adminId, { requestId, isApproved, bankT
  * Kiểm tra điều kiện ký quỹ trước khi cho phép cụm sân nhận đặt lịch
  */
 async function checkCourtDepositEligibility(ownerId, adminSupabase = null) {
+  if (adminSupabase) {
+    try {
+      const { data: kyQuyRows, error: kqErr } = await adminSupabase
+        .from('kyquy')
+        .select('*')
+        .eq('machusan', ownerId);
+
+      if (!kqErr && kyQuyRows && kyQuyRows.length > 0) {
+        const dep = kyQuyRows[0];
+        const totalBalance = Number(dep.sodu_hientai || dep.sotien || 0);
+        const lockedBalance = Number(dep.sodu_dongbang || 0);
+        const availableBalance = Number(dep.sodu_khadung ?? (totalBalance - lockedBalance));
+
+        if (dep.trangthai === 'DA_DUYET' || dep.trangthai === 'HOAT_DONG') {
+          return { allowed: true, deposit: dep, balance: totalBalance, available: availableBalance };
+        }
+        if (dep.trangthai === 'CHO_DUYET') {
+          return { allowed: false, reason: 'Yêu cầu ký quỹ 1.000.000đ của Chủ sân đang chờ Admin xét duyệt.' };
+        }
+        return { allowed: false, reason: 'Tài khoản ký quỹ của Chủ sân chưa được kích hoạt hoặc đang bị tạm khóa.' };
+      }
+
+      // Check legacy owner
+      let isLegacyOwner = false;
+      try {
+        const { data: fields } = await adminSupabase.from('san').select('masan').eq('machusan', ownerId).limit(1);
+        if (fields && fields.length > 0) isLegacyOwner = true;
+      } catch {}
+
+      if (isLegacyOwner) {
+        return { allowed: true, isLegacy: true, balance: 1000000 };
+      }
+      return { allowed: false, reason: 'Chủ sân chưa tạo hồ sơ ký quỹ bảo đảm 1.000.000đ.' };
+    } catch (e) {
+      // Fall through to localPool
+    }
+  }
+
   const client = await localPool.connect();
   try {
     const res = await client.query('SELECT * FROM kyquy WHERE machusan = $1', [ownerId]);
@@ -996,13 +1034,28 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
     if (adminSupabase) {
       try {
         const ownerId = booking.san?.machusan;
-        if (ownerId && isOnlinePaid && totalAmount > 0) {
-          await adminSupabase.from('thongbao').insert({
-            manguoidung: ownerId,
-            tieude: '💸 Yêu cầu hoàn tiền từ Khách hủy sân',
-            noidung: `Khách hàng vừa hủy hợp lệ đơn #${bookingId} trước 4 giờ. Vui lòng chuyển hoàn 100% số tiền ${totalAmount.toLocaleString('vi-VN')}đ trong vòng 24h.`,
-            loaithongbao: 'REFUND_REQUEST'
-          });
+        const sanName = booking.san?.tensan || 'sân';
+        const bookingDate = booking.ngaysudung || '';
+
+        if (ownerId) {
+          if (isOnlinePaid && totalAmount > 0) {
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: ownerId,
+              tieude: '💸 Yêu cầu hoàn tiền từ Khách hủy sân',
+              noidung: `Khách hàng vừa hủy hợp lệ đơn #${bookingId} trước 4 giờ. Vui lòng chuyển hoàn 100% số tiền ${totalAmount.toLocaleString('vi-VN')}đ trong vòng 24h.`,
+              loaithongbao: 'REFUND_REQUEST',
+              metadata: { bookingId, refundId: refundRecord?.mahoantien, date: bookingDate, role: 'CHUSAN' }
+            });
+          } else {
+            // TASK 02 (V4-02): Thông báo cho chủ sân khi khách hủy đơn tiền mặt
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: ownerId,
+              tieude: `🚫 Khách hàng đã hủy đơn đặt sân #${bookingId}`,
+              noidung: `Khách hàng vừa hủy lịch tại ${sanName} ngày ${bookingDate} (đơn thanh toán tiền mặt). Khung giờ đã được cập nhật mở lại trên hệ thống.`,
+              loaithongbao: 'BOOKING_CANCELLED',
+              metadata: { bookingId, date: bookingDate, sanName, role: 'CHUSAN' }
+            });
+          }
         }
         await adminSupabase.from('thongbao').insert({
           manguoidung: customerId,
@@ -1010,7 +1063,8 @@ async function processCustomerCancellation({ bookingId, customerId, refundAccoun
           noidung: isOnlinePaid
             ? `Đơn #${bookingId} đã được hủy hợp lệ. Chủ sân sẽ chuyển hoàn 100% (${totalAmount.toLocaleString('vi-VN')}đ) vào tài khoản của bạn trong 24h.`
             : `Đơn #${bookingId} (thanh toán tiền mặt) đã được hủy thành công.`,
-          loaithongbao: 'BOOKING_CANCELLED'
+          loaithongbao: 'BOOKING_CANCELLED',
+          metadata: { bookingId, date: bookingDate, role: 'KHACHHANG' }
         });
       } catch (notifErr) {
         console.error('Non-critical notification delivery failure:', notifErr.message);
@@ -1366,13 +1420,28 @@ async function processPartialCustomerCancellation({
     if (adminSupabase) {
       try {
         const ownerId = booking.san?.machusan;
-        if (ownerId && isOnlinePaid && refundAmount > 0) {
-          await adminSupabase.from('thongbao').insert({
-            manguoidung: ownerId,
-            tieude: '💸 Yêu cầu hoàn tiền hủy một phần ca đặt sân',
-            noidung: `Khách hàng vừa hủy ${normalizedSlotIds.length} khung giờ của đơn #${bookingId} trước 4 giờ. Số tiền hoàn lại: ${refundAmount.toLocaleString('vi-VN')}đ. Vui lòng chuyển hoàn trong vòng 24h.`,
-            loaithongbao: 'REFUND_REQUEST'
-          });
+        const sanName = booking.san?.tensan || 'sân';
+        const bookingDate = booking.ngaysudung || '';
+
+        if (ownerId) {
+          if (isOnlinePaid && refundAmount > 0) {
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: ownerId,
+              tieude: '💸 Yêu cầu hoàn tiền hủy một phần ca đặt sân',
+              noidung: `Khách hàng vừa hủy ${normalizedSlotIds.length} khung giờ của đơn #${bookingId} trước 4 giờ. Số tiền hoàn lại: ${refundAmount.toLocaleString('vi-VN')}đ. Vui lòng chuyển hoàn trong vòng 24h.`,
+              loaithongbao: 'REFUND_REQUEST',
+              metadata: { bookingId, date: bookingDate, role: 'CHUSAN' }
+            });
+          } else {
+            // TASK 02 (V4-02): Thông báo cho chủ sân khi khách hủy một phần đơn tiền mặt
+            await adminSupabase.from('thongbao').insert({
+              manguoidung: ownerId,
+              tieude: `⚠️ Khách hàng đã hủy một phần đơn #${bookingId}`,
+              noidung: `Khách hàng vừa hủy ${normalizedSlotIds.length} khung giờ của đơn #${bookingId} tại ${sanName}. Số tiền thu tại sân điều chỉnh còn ${newTotal.toLocaleString('vi-VN')}đ.`,
+              loaithongbao: 'BOOKING_UPDATED',
+              metadata: { bookingId, date: bookingDate, sanName, role: 'CHUSAN' }
+            });
+          }
         }
         await adminSupabase.from('thongbao').insert({
           manguoidung: customerId,
@@ -1380,7 +1449,8 @@ async function processPartialCustomerCancellation({
           noidung: isOnlinePaid
             ? `Đã hủy thành công ${normalizedSlotIds.length} khung giờ của đơn #${bookingId}. Số tiền ${refundAmount.toLocaleString('vi-VN')}đ sẽ được Chủ sân hoàn trả trong 24h.`
             : `Đã hủy thành công ${normalizedSlotIds.length} khung giờ của đơn #${bookingId}. Số tiền thanh toán tại sân đã giảm xuống còn ${newTotal.toLocaleString('vi-VN')}đ.`,
-          loaithongbao: 'BOOKING_UPDATED'
+          loaithongbao: 'BOOKING_UPDATED',
+          metadata: { bookingId, date: bookingDate, role: 'KHACHHANG' }
         });
       } catch (notifErr) {
         console.error('Non-critical notification delivery failure:', notifErr.message);

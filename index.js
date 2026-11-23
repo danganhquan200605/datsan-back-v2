@@ -525,6 +525,378 @@ app.post('/api/bookings', async (req, res) => {
   return res.json({ data });
 });
 
+// TASK 05 & TASK 06 (V4-05, V4-06): HỦY ĐƠN CHỜ THANH TOÁN & GIẢI PHÓNG KHUNG GIỜ
+app.post('/api/bookings/:id/cancel-pending', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+
+  const bookingId = Number(req.params.id);
+  if (!bookingId || isNaN(bookingId)) {
+    return res.status(400).json({ error: 'Mã đơn đặt sân không hợp lệ' });
+  }
+
+  const callerId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+
+  try {
+    const { data: booking, error: bErr } = await adminSupabase
+      .from('datsan')
+      .select('*, san(machusan)')
+      .eq('madatsan', bookingId)
+      .single();
+
+    if (bErr || !booking) {
+      return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+    }
+
+    const isOwner = authData.role === 'CHUSAN' && Number(booking.san?.machusan) === callerId;
+    const isCustomer = Number(booking.makhachhang) === callerId;
+    const isAdmin = authData.role === 'ADMIN';
+
+    if (!isCustomer && !isOwner && !isAdmin) {
+      return res.status(403).json({ error: 'Forbidden: Bạn không có quyền hủy đơn này' });
+    }
+
+    const currentStatus = String(booking.trangthai || '').toUpperCase();
+    if (currentStatus === 'DA_HUY' || currentStatus === 'DAHUY') {
+      return res.json({ success: true, message: 'Đơn đặt sân đã được hủy trước đó.', bookingId });
+    }
+
+    if (currentStatus !== 'CHO_THANH_TOAN' && currentStatus !== 'CHOXACNHAN') {
+      return res.status(400).json({
+        error: 'Chỉ có thể hủy giải phóng tức thì đối với đơn chờ thanh toán. Đơn đã thanh toán cần thực hiện quy trình hủy hoàn tiền.',
+        currentStatus
+      });
+    }
+
+    // 1. Giải phóng khung giờ đặt sân tức thì
+    const { error: delErr } = await adminSupabase
+      .from('datsan_khunggio')
+      .delete()
+      .eq('madatsan', bookingId);
+
+    if (delErr) {
+      console.warn('Lỗi xóa khung giờ khi hủy pending booking:', delErr.message);
+    }
+
+    // 2. Cập nhật trạng thái đơn sang DA_HUY
+    let meta = {};
+    try { meta = JSON.parse(booking.ghichu || '{}'); } catch {}
+    meta.cancelledReason = 'Khách hủy trong quá trình thanh toán (Giải phóng slot)';
+    meta.cancelledAt = new Date().toISOString();
+    meta.cancelledBy = callerId;
+
+    await adminSupabase
+      .from('datsan')
+      .update({
+        trangthai: 'DA_HUY',
+        ghichu: JSON.stringify(meta)
+      })
+      .eq('madatsan', bookingId);
+
+    return res.json({
+      success: true,
+      message: 'Đã hủy đơn chờ thanh toán và giải phóng toàn bộ khung giờ thành công.',
+      bookingId
+    });
+  } catch (err) {
+    console.error('Lỗi khi hủy pending booking:', err);
+    return res.status(500).json({ error: 'Lỗi server khi hủy đơn chờ thanh toán: ' + err.message });
+  }
+});
+
+// TASK 04 (V4-04): ĐỔI PHƯƠNG THỨC THANH TOÁN TRÊN CÙNG ĐƠN ĐẶT (CHỐNG TRÙNG SLOT)
+app.post('/api/bookings/:id/switch-method', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData) return res.status(401).json({ error: 'Unauthorized: Missing or invalid access token' });
+
+  const bookingId = Number(req.params.id);
+  const targetMethod = req.body?.paymentMethod === 'TIEN_MAT' ? 'TIEN_MAT' : 'QR';
+  const callerId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+
+  try {
+    const { data: booking, error: bErr } = await adminSupabase
+      .from('datsan')
+      .select('*, san(machusan, tensan), datsan_khunggio(khunggio(giobatdau, gioketthuc))')
+      .eq('madatsan', bookingId)
+      .single();
+
+    if (bErr || !booking) {
+      return res.status(404).json({ error: 'Không tìm thấy đơn đặt sân' });
+    }
+
+    if (Number(booking.makhachhang) !== callerId && authData.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: Bạn không sở hữu đơn đặt sân này' });
+    }
+
+    const currentStatus = String(booking.trangthai || '').toUpperCase();
+    if (currentStatus === 'DA_THANH_TOAN' || currentStatus === 'HOAN_THANH') {
+      return res.status(400).json({ error: 'Đơn đặt sân đã được thanh toán hoặc hoàn thành, không thể đổi phương thức.' });
+    }
+    if (currentStatus === 'DA_HUY') {
+      return res.status(400).json({ error: 'Đơn đặt sân đã bị hủy, không thể đổi phương thức.' });
+    }
+
+    let meta = {};
+    try { meta = JSON.parse(booking.ghichu || '{}'); } catch {}
+
+    if (targetMethod === 'TIEN_MAT') {
+      // Xác thực giới hạn tối đa 120 phút cho tiền mặt
+      const slots = (booking.datsan_khunggio || []).map(s => s.khunggio).filter(Boolean);
+      const duration = calculateDurationMinutesFromSlots(slots);
+      if (duration > 120) {
+        return res.status(400).json({
+          error: `Thanh toán tiền mặt chỉ áp dụng cho đơn đặt sân tối đa 2 giờ (120 phút). Đơn hiện tại có thời lượng ${duration} phút.`,
+          code: 'ERR_CASH_DURATION_LIMIT'
+        });
+      }
+
+      meta.paymentMethod = 'TIEN_MAT';
+      meta.paymentStatus = 'UNPAID';
+      meta.commissionStatus = 'CHO_XAC_NHAN_TRAN';
+
+      await adminSupabase.from('datsan').update({
+        trangthai: 'CHO_THI_DAU',
+        ghichu: JSON.stringify(meta)
+      }).eq('madatsan', bookingId);
+
+      // Thông báo cho Chủ sân
+      const ownerId = booking.san?.machusan;
+      if (ownerId) {
+        await adminSupabase.from('thongbao').insert({
+          manguoidung: ownerId,
+          tieude: '🔔 Đơn đặt sân mới (Chuyển sang tiền mặt)!',
+          noidung: `Khách hàng vừa chuyển đơn #${bookingId} tại ${booking.san?.tensan || 'sân'} sang hình thức thanh toán 100% tiền mặt tại sân.`,
+          loaithongbao: 'BOOKING',
+          metadata: { bookingId, date: booking.ngaysudung, role: 'CHUSAN' }
+        });
+      }
+
+      return res.json({
+        success: true,
+        bookingId,
+        status: 'CHO_THI_DAU',
+        paymentMethod: 'TIEN_MAT',
+        booking: {
+          madatsan: bookingId,
+          trangthai: 'CHO_THI_DAU',
+          phuongthuctt: 'TIEN_MAT'
+        },
+        message: 'Đã chuyển sang hình thức thanh toán tiền mặt tại sân thành công.'
+      });
+    } else {
+      // Chuyển sang QR
+      meta.paymentMethod = 'QR';
+      meta.commissionStatus = 'CHO_THANH_TOAN';
+
+      await adminSupabase.from('datsan').update({
+        trangthai: 'CHO_THANH_TOAN',
+        ghichu: JSON.stringify(meta)
+      }).eq('madatsan', bookingId);
+
+      return res.json({
+        success: true,
+        bookingId,
+        status: 'CHO_THANH_TOAN',
+        paymentMethod: 'QR',
+        booking: {
+          madatsan: bookingId,
+          trangthai: 'CHO_THANH_TOAN',
+          phuongthuctt: 'QR'
+        },
+        message: 'Đã chuyển sang phương thức quét mã QR trực tuyến.'
+      });
+    }
+  } catch (err) {
+    console.error('Lỗi đổi phương thức thanh toán:', err);
+    return res.status(500).json({ error: 'Lỗi server khi đổi phương thức: ' + err.message });
+  }
+});
+
+// TASK 11 (V4-11): NGHIỆP VỤ CHỦ SÂN TẠO ĐƠN ĐẶT QUA ĐIỆN THOẠI (NGUỒN PHONE)
+app.post('/api/owner/phone-booking', async (req, res) => {
+  if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const authData = await getAuthenticatedProfile(req);
+  if (!authData || (authData.role !== 'CHUSAN' && authData.role !== 'ADMIN')) {
+    return res.status(403).json({ error: 'Forbidden: Yêu cầu quyền Chủ sân hoặc Quản trị viên' });
+  }
+
+  const callerId = Number(authData.profile.MaNguoiDung ?? authData.profile.manguoidung ?? authData.profile.id);
+  const masan = Number(req.body?.masan);
+  const date = String(req.body?.date || '').trim();
+  const slotIds = req.body?.slotIds;
+  const customerName = String(req.body?.customerName || '').trim();
+  const customerPhone = String(req.body?.customerPhone || '').trim();
+  const note = String(req.body?.note || '').trim();
+
+  if (!Number.isInteger(masan) || masan <= 0) {
+    return res.status(400).json({ error: 'Mã sân không hợp lệ' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Ngày sử dụng không hợp lệ (định dạng YYYY-MM-DD)' });
+  }
+  if (!Array.isArray(slotIds) || slotIds.length === 0 || slotIds.length > 14) {
+    return res.status(400).json({ error: 'Vui lòng chọn từ 1 đến 14 khung giờ thi đấu' });
+  }
+  if (!customerName || customerName.length < 2) {
+    return res.status(400).json({ error: 'Vui lòng nhập họ tên khách hàng (tối thiểu 2 ký tự)' });
+  }
+  if (!/^(0|\+84)[3|5|7|8|9][0-9]{8}$/.test(customerPhone.replace(/[\s.-]/g, ''))) {
+    return res.status(400).json({ error: 'Số điện thoại khách hàng không đúng định dạng Việt Nam' });
+  }
+
+  try {
+    // 1. Xác thực quyền sở hữu sân
+    const { data: court, error: courtErr } = await adminSupabase
+      .from('san')
+      .select('masan, tensan, machusan, giacoban')
+      .eq('masan', masan)
+      .single();
+
+    if (courtErr || !court) {
+      return res.status(404).json({ error: 'Không tìm thấy thông tin sân thể thao' });
+    }
+    if (authData.role !== 'ADMIN' && Number(court.machusan) !== callerId) {
+      return res.status(403).json({ error: 'Forbidden: Bạn chỉ có thể tạo đơn cho sân thuộc quyền quản lý của mình' });
+    }
+
+    // 2. Kiểm tra ngày không thuộc quá khứ
+    const nowVnDate = new Date();
+    const vnDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).format(nowVnDate);
+    const vnTimeStr = new Intl.DateTimeFormat('en-GB', { 
+      timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false 
+    }).format(nowVnDate);
+
+    if (date < vnDateStr) {
+      return res.status(400).json({ error: 'Không thể tạo đơn đặt sân trong ngày quá khứ.' });
+    }
+
+    // 3. Lấy thông tin chi tiết các khung giờ đã chọn
+    const normalizedSlotIds = slotIds.map(Number);
+    const { data: dbSlots, error: slotErr } = await adminSupabase
+      .from('khunggio')
+      .select('makhunggio, giobatdau, gioketthuc')
+      .eq('masan', masan)
+      .in('makhunggio', normalizedSlotIds);
+
+    if (slotErr || !dbSlots || dbSlots.length !== normalizedSlotIds.length) {
+      return res.status(400).json({ error: 'Một hoặc nhiều khung giờ không hợp lệ trên sân này' });
+    }
+
+    // Nếu là ngày hôm nay: Kiểm tra khung giờ không nằm trong quá khứ
+    if (date === vnDateStr) {
+      const pastSlot = dbSlots.find(s => String(s.giobatdau || '').slice(0, 8) <= vnTimeStr);
+      if (pastSlot) {
+        return res.status(400).json({
+          error: `Khung giờ ${String(pastSlot.giobatdau || '').slice(0, 5)} đã qua hoặc đang diễn ra. Chỉ được đặt khung giờ tương lai.`
+        });
+      }
+    }
+
+    // 4. Giới hạn tối đa 120 phút cho tiền mặt
+    const totalMinutes = calculateDurationMinutesFromSlots(dbSlots);
+    if (totalMinutes > 120) {
+      return res.status(400).json({
+        error: `Đặt sân tiền mặt chỉ áp dụng tối đa 2 giờ (120 phút). Đơn yêu cầu có thời lượng ${totalMinutes} phút.`,
+        code: 'ERR_CASH_DURATION_LIMIT'
+      });
+    }
+
+    // 5. Kiểm tra xung đột khung giờ (chống đặt trùng slot)
+    const { data: conflicts } = await adminSupabase
+      .from('datsan_khunggio')
+      .select('makhunggio, datsan!inner(madatsan, masan, ngaysudung, trangthai)')
+      .eq('datsan.masan', masan)
+      .eq('datsan.ngaysudung', date)
+      .not('datsan.trangthai', 'in', '("DA_HUY","DAHUY")')
+      .in('makhunggio', normalizedSlotIds);
+
+    if (conflicts && conflicts.length > 0) {
+      return res.status(400).json({
+        error: 'Một hoặc nhiều khung giờ đã được đặt trước đó bởi khách hàng khác. Vui lòng chọn khung giờ trống.',
+        code: 'ERR_SLOTS_ALREADY_BOOKED'
+      });
+    }
+
+    // 6. Tra cứu khách hàng theo số điện thoại (nếu đã có tài khoản trên hệ thống)
+    const cleanPhone = customerPhone.replace(/[\s.-]/g, '');
+    const standardPhone = cleanPhone.startsWith('+84') ? '0' + cleanPhone.slice(3) : cleanPhone;
+    const { data: matchedCustomer } = await adminSupabase
+      .from('nguoidung')
+      .select('manguoidung, hoten')
+      .or(`sodienthoai.eq.${standardPhone},sodienthoai.eq.+84${standardPhone.replace(/^0+/, '')}`)
+      .limit(1)
+      .maybeSingle();
+
+    const customerId = matchedCustomer?.manguoidung || null;
+
+    // 7. Tính tổng tiền và hoa hồng sàn 10%
+    const pricePerSlot = Number(court.giacoban || 200000);
+    const totalPrice = pricePerSlot * normalizedSlotIds.length;
+    const commissionAmount = Math.round(totalPrice * 0.1);
+
+    const meta = {
+      bookingSource: 'PHONE',
+      customerName,
+      customerPhone: standardPhone,
+      note,
+      paymentMethod: 'TIEN_MAT',
+      paymentStatus: 'UNPAID', // Chưa thu tiền mặt
+      commissionRate: 0.1,
+      commissionAmount,
+      commissionStatus: 'CHO_XAC_NHAN_TRAN',
+      createdBy: callerId,
+      createdRole: authData.role,
+      createdAt: new Date().toISOString()
+    };
+
+    // 8. Tạo bản ghi đơn đặt sân trong bảng datsan (hỗ trợ makhachhang = null cho khách vãng lai)
+    const { data: newBooking, error: insErr } = await adminSupabase
+      .from('datsan')
+      .insert({
+        masan,
+        makhachhang: customerId,
+        ngaydat: vnDateStr,
+        ngaysudung: date,
+        tongtien: totalPrice,
+        tiencoc: 0,
+        trangthai: 'CHO_THI_DAU',
+        ghichu: JSON.stringify(meta)
+      })
+      .select()
+      .single();
+
+    if (insErr) throw insErr;
+    const newBookingId = newBooking.madatsan;
+    newBooking.meta = meta;
+    newBooking.nguon_dat = meta.bookingSource;
+    newBooking.phuongthuctt = meta.paymentMethod;
+
+    // 9. Giữ các khung giờ tương ứng trong datsan_khunggio
+    const slotInserts = normalizedSlotIds.map(slotId => ({
+      madatsan: newBookingId,
+      makhunggio: slotId,
+      giatien: pricePerSlot
+    }));
+    const { error: slotInsErr } = await adminSupabase.from('datsan_khunggio').insert(slotInserts);
+    if (slotInsErr) {
+      console.warn('Lỗi chèn datsan_khunggio:', slotInsErr.message);
+      throw slotInsErr;
+    }
+
+    return res.status(201).json({
+      success: true,
+      data: newBooking,
+      booking: newBooking,
+      message: `Đã tạo đơn đặt sân qua điện thoại #${newBookingId} thành công cho khách hàng ${customerName}.`
+    });
+  } catch (err) {
+    console.error('Lỗi tạo đơn đặt sân qua điện thoại:', err);
+    return res.status(500).json({ error: 'Lỗi server khi tạo đơn qua điện thoại: ' + err.message });
+  }
+});
+
 app.get('/api/owner/overview', async (req, res) => {
   if (!supabase || !adminSupabase) return res.status(503).json({ error: 'Supabase is not configured' });
   const authData = await getAuthenticatedProfile(req);
@@ -693,7 +1065,17 @@ app.post('/api/owner/settle-booking', async (req, res) => {
           return res.status(400).json({ error: 'Đơn đặt sân đã được thanh toán trực tuyến mô phỏng (DEMO), không thể thu tiền mặt.' });
         }
 
+        // TASK 01 (V4-01): Bắt buộc Idempotency - Không cho phép xác nhận thu tiền mặt nhiều lần
+        if (meta.cashReceivedAt || meta.paymentStatus === 'PAID') {
+          const receivedDate = meta.cashReceivedAt ? new Date(meta.cashReceivedAt).toLocaleString('vi-VN') : 'trước đó';
+          return res.status(400).json({
+            error: `Đơn đặt sân này đã được xác nhận thu tiền mặt (${receivedDate}). Không thể xác nhận thu tiền nhiều lần.`,
+            code: 'ALREADY_CONFIRMED'
+          });
+        }
+
         meta.paymentMethod = 'TIEN_MAT';
+        meta.paymentStatus = 'PAID';
         meta.cashReceivedAt = new Date().toISOString();
         meta.commissionStatus = 'CHO_CHUSAN_NOP'; // Ghi nợ hoa hồng 10%
         meta.commissionAmount = Math.round(Number(booking.tongtien || 0) * 0.1);
